@@ -1,0 +1,11 @@
+[project]
+name = "comfyui_relay_api"
+version = "1.0.0"
+description = "ComfyUI nodes and a manager for third-party API relays: text, image and video models. ComfyUI 中转站 API 节点和管理器。"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/BennettL569/comfyui_relay_api"

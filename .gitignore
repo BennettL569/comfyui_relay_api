@@ -1,0 +1,6 @@
+relays.json
+relays.json.*
+.relays-*.json
+__pycache__/
+*.pyc
+.DS_Store
