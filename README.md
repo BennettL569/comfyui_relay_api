@@ -2,7 +2,7 @@
 
 [English](README_EN.md)
 
-在 ComfyUI 里通过第三方中转站调用文本、生图、生视频模型，可以同时配置多个站。自带「中转站管理器」：粘贴地址和令牌就能添加中转站，一键测试、查看模型、把配好的节点放到画布上。
+在 Comfy Desktop 和 ComfyUI 里通过第三方中转站调用文本、生图、生视频模型，可以同时配置多个站。自带「中转站管理器」：粘贴地址和令牌就能添加中转站，一键测试、查看模型、把配好的节点放到画布上。
 
 适配 new-api / one-api 等搭建的 OpenAI 兼容中转站，也能接 Gemini 原生、Sora 格式和厂商原生格式。
 
@@ -12,46 +12,51 @@
 
 ## 安装
 
-需要本地运行的 ComfyUI（在 0.43.2 上测试过，太旧的版本加载不了节点，先更新）。不需要另外装依赖。
+主要面向 Comfy Desktop，普通 ComfyUI 也能用。需要本地运行的实例（在 ComfyUI 0.43.2 上测试过，太旧的版本加载不了节点，先更新）。不需要另外装依赖。
 
-**方式一：ComfyUI Manager。** 打开 Custom Nodes Manager，点 Install via Git URL，填：
+### Comfy Desktop
 
-```
-https://github.com/BennettL569/comfyui_relay_api
-```
+Desktop 自带的扩展管理器只搜 Comfy Registry，这个插件还没有上架，暂时手动安装：
 
-**方式二：命令行。**
+1. 在 GitHub 页面点 Code → Download ZIP。
+2. 在 Desktop 的实例菜单里点「打开文件夹」，进入里面的 `ComfyUI\custom_nodes`。
+3. 把压缩包解压到这里。`__init__.py` 要直接在插件文件夹里（`custom_nodes\comfyui_relay_api-main\__init__.py`），不要多套一层。
+4. 重启这个实例，左侧栏会多一个链条图标（中文界面下叫「中转站」，英文界面下叫 Relay）。
+
+要装在本地实例上：`Comfy Cloud` 跑在云端，装不了这个插件。
+
+### 其他 ComfyUI
+
+命令行安装：
 
 ```bash
 cd <ComfyUI 目录>/custom_nodes
 git clone https://github.com/BennettL569/comfyui_relay_api.git
 ```
 
-**方式三：下载 ZIP。** 在 GitHub 页面点 Code → Download ZIP，解压到 `<ComfyUI 目录>/custom_nodes/` 里。
+也可以用上面的 ZIP，或者旧版 ComfyUI Manager 界面里的 Install via Git URL。装好后重启 ComfyUI。
 
-装好后重启 ComfyUI，左侧栏会多一个「中转站」图标（链条图标）。
+### 语言、更新和卸载
 
-**Comfy Desktop：** 要用本地实例，放进实例目录的 `ComfyUI\custom_nodes` 里。`Comfy Cloud` 跑在云端，装不了这个插件。
+**语言：** 界面默认英文。ComfyUI 的语言是中文时，节点和左侧面板会自动显示中文；独立窗口右上角有语言开关。
 
-**更新：** 在插件目录运行 `git pull`，再重启 ComfyUI。你配置的中转站不受影响。
+**更新：** 下载新的 ZIP 解压覆盖；用 git 装的，在插件目录运行 `git pull`。然后重启实例。你配置的中转站不受影响。Desktop 更新 ComfyUI 时也不会动这个插件。
 
 **卸载：** 删除插件目录。中转站配置 `relays.json` 也在里面，需要的话先备份。
 
 ## 快速开始
 
-1. 点左侧栏的「中转站」图标，再点「添加中转站」。
-2. 把站点给你的地址和令牌整段粘贴进最上面的框，会自动识别并填好。
+1. 打开「中转站管理器」窗口：点左侧栏的链条图标，面板里会显示启动文件的路径。点「复制路径」，粘贴到文件资源管理器的地址栏或「运行」框（Win+R），按回车。也可以直接双击插件目录里的 `tools\start_manager.bat`；想要桌面和开始菜单快捷方式，双击 `tools\create_shortcut.bat`。macOS、Linux 运行 `sh tools/start_manager.sh`。
+2. 点「添加中转站」，把站点给你的地址和令牌整段粘贴进最上面的框，会自动识别并填好。
 3. 点「测试连接」确认能连上，再点「保存」。
-4. 在模型列表里找到要用的模型，点「添加到画布」，画布上就多了一个配好的节点。写上提示词就能运行。
+4. 在模型列表里找到要用的模型，点「添加到画布」，正在打开的 ComfyUI 画布上就多了一个配好的节点。写上提示词就能运行。
 
 ## 中转站管理器
 
-有两种打开方式，用的是同一套界面和同一份配置：
+有两个入口，用的是同一套界面和同一份配置：
 
-- **ComfyUI 左侧栏的「中转站」图标：** 在 ComfyUI 里直接管理。
-- **独立窗口：** 不用打开 ComfyUI 也能用。ComfyUI 开着的话，这里的修改会自动同步到节点的下拉框，「添加到画布」也会把节点放进正在打开的 ComfyUI。
-  - Windows：双击 `tools\start_manager.bat`。想要桌面和开始菜单快捷方式，双击 `tools\create_shortcut.bat`。
-  - macOS、Linux：运行 `sh tools/start_manager.sh`。
+- **独立窗口：** 添加、修改、测试中转站都在这里，不用打开 ComfyUI 也能用。ComfyUI 开着的话，修改会自动同步到节点的下拉框，「添加到画布」也会把节点放进正在打开的 ComfyUI。
+- **ComfyUI 左侧栏的面板：** 查看中转站和模型、测试已保存的站、把节点放到画布上。默认不能在这里修改中转站（原因见「安全说明」）；想在这里改，到独立窗口里勾选「允许在 ComfyUI 侧边栏里修改中转站」。
 
 保存中转站后可以：
 
@@ -64,14 +69,14 @@ git clone https://github.com/BennettL569/comfyui_relay_api.git
 
 ## 节点
 
-在节点库里搜「中转站」：
+在节点库里搜「中转站」或 relay：
 
-| 节点 | 作用 |
+| 节点（英文名） | 作用 |
 |---|---|
-| 中转站 · 文本对话 | 调用 `/v1/chat/completions`，接上图片就能识图、反推提示词，回复直接显示在节点上 |
-| 中转站 · 生图 | 文生图、改图，参考图可以一次接多张（图片批次） |
-| 中转站 · 生视频 | 文生视频、图生视频，自动轮询进度并下载成片，接「保存视频」节点即可 |
-| 中转站 · 模型列表 | 列出站里有哪些模型 |
+| 中转站 · 文本对话（Relay Chat） | 调用 `/v1/chat/completions`，接上图片就能识图、反推提示词，回复直接显示在节点上 |
+| 中转站 · 生图（Relay Image） | 文生图、改图，参考图可以一次接多张（图片批次） |
+| 中转站 · 生视频（Relay Video） | 文生视频、图生视频，自动轮询进度并下载成片，接「保存视频」节点即可 |
+| 中转站 · 模型列表（Relay Models） | 列出站里有哪些模型 |
 
 ### 生图的「接口格式」
 
@@ -129,7 +134,11 @@ git clone https://github.com/BennettL569/comfyui_relay_api.git
 - 下载图片和视频时，只有和中转站同源的地址才带令牌。
 - 管理器的接口只接受用 IP 或 localhost 访问（防 DNS 重绑定攻击）。通过域名访问 ComfyUI 的话，把域名加到环境变量 `COMFY_RELAY_ALLOWED_HOSTS`（逗号分隔）。
 - 独立管理器只监听 127.0.0.1，并且每次启动生成一次性令牌。
-- ComfyUI 本身没有登录验证。如果用 `--listen` 把它开放到局域网或公网，能访问 ComfyUI 的人也能用你配置的中转站发请求：他们看不到令牌，但产生的费用算你的。
+- 工作流只能按名字选中转站，改不了地址和令牌，也拿不到令牌。
+- ComfyUI 的接口默认不能添加、修改中转站，也不能测试没保存的地址：ComfyUI 没有登录验证，内网穿透过来的请求看起来也像来自本机。只有带一次性令牌的独立窗口能改。勾选「允许在 ComfyUI 侧边栏里修改中转站」后，运行 ComfyUI 的这台电脑发来的同源请求也可以改；这个开关存在配置文件里，ComfyUI 的接口改不了。ComfyUI 跑在云主机上的话，直接编辑那台机器上的 `relays.json`。
+- 接口回复里的下载地址不是中转站自己的时候，不允许指向本机和内网（防止工作流借模型回复读取内网内容），报错里也不带对方返回的内容。文件确实放在内网的话，在这台电脑上设环境变量 `COMFY_RELAY_ALLOW_PRIVATE_DOWNLOADS=1`。
+- 带令牌的请求不会跟随去别的站点的重定向，令牌不会离开这个站。
+- ComfyUI 本身没有登录验证。如果用 `--listen` 把它开放到局域网或公网，能访问 ComfyUI 的人也能运行工作流、用你配置的中转站发请求：他们看不到令牌，但产生的费用算你的。
 
 ## 其他说明
 
@@ -137,7 +146,7 @@ git clone https://github.com/BennettL569/comfyui_relay_api.git
 - 生视频时节点上会实时显示任务状态、进度和已等待时间，随时可以点取消。
 - ComfyUI 不在默认端口（8188-8197）时，独立管理器找不到它，可以设环境变量 `COMFY_RELAY_COMFY_PORTS`，例如 `8000,8188-8190`。
 - 独立管理器的日志：Windows 在 `%LOCALAPPDATA%\comfyui_relay_api\manager.log`，macOS、Linux 在 `~/.local/state/comfyui_relay_api/manager.log`。
-- 界面目前只有中文。
+- 只调接口、不打开 ComfyUI 页面时，节点的报错默认是英文，可以设环境变量 `COMFY_RELAY_LANG=zh` 改成中文。
 
 ## 常见问题
 
@@ -152,7 +161,10 @@ git clone https://github.com/BennettL569/comfyui_relay_api.git
 | 连不上中转站 | 网络问题，给这个站配上代理 |
 | 下拉框里没有新加的站 | 在 ComfyUI 界面按 R 刷新节点 |
 | 插件更新后，管理器里的模型分类还是旧的 | 开着的窗口还在用旧代码。独立窗口再打开一次就会换成新代码，旧窗口可以关掉；左侧栏的面板要重启 ComfyUI |
-| 左侧栏没有「中转站」图标 | 插件不在 `custom_nodes` 里，或者 ComfyUI 还没重启。Comfy Desktop 的话确认开的是本地实例，不是 Comfy Cloud |
+| 左侧栏没有链条图标 | 插件不在 `custom_nodes` 里，ZIP 解压时多套了一层目录，或者 ComfyUI 还没重启。Comfy Desktop 的话确认开的是本地实例，不是 Comfy Cloud |
+| 左侧面板里没有「添加中转站」按钮 | 默认要在独立窗口里添加，见上面的「中转站管理器」 |
+| `拒绝从 … 下载` | 站点返回的文件地址在内网，见上面的「安全说明」 |
+| `站点把这个请求重定向到了 …` | 接口地址可能写错了，比如 http 和 https 写反，改成重定向后的地址 |
 | 独立窗口打不开 | Windows 上 `start_manager.bat` 会提示找不到哪个文件。启动日志见上面的「其他说明」 |
 
 ## 测试

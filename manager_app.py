@@ -31,6 +31,7 @@ from aiohttp import WSMsgType, web  # noqa: E402
 
 import manager_api  # noqa: E402
 import relay_client as rc  # noqa: E402
+from relay_i18n import tr  # noqa: E402
 
 log = logging.getLogger("comfyui_relay_api.manager")
 
@@ -106,7 +107,7 @@ class ComfyLink:
     async def notify(self, event: dict) -> None:
         port = await self.find() or await self.find(refresh=True)
         if not port:
-            raise rc.RelayError("没有检测到正在运行的 ComfyUI（需要先启动 ComfyUI）")
+            raise rc.RelayError(tr("No running ComfyUI detected (start ComfyUI first)"))
         try:
             async with self._client().post(f"http://127.0.0.1:{port}{manager_api.PREFIX}/notify", json=event) as r:
                 if r.status != 200:
@@ -115,10 +116,10 @@ class ComfyLink:
                     except ValueError:
                         data = None
                     message = data.get("error") if isinstance(data, dict) else None
-                    raise rc.RelayError(message or f"ComfyUI 返回 HTTP {r.status}")
+                    raise rc.RelayError(message or tr("ComfyUI returned HTTP {status}", status=r.status))
         except (aiohttp.ClientError, TimeoutError) as e:
             self.port = None
-            raise rc.RelayError(f"连不上 ComfyUI：{e}") from None
+            raise rc.RelayError(tr("Cannot reach ComfyUI: {error}", error=e)) from None
 
     async def close(self) -> None:
         if self._session is not None:
@@ -154,12 +155,12 @@ class ManagerServer:
         host = (request.host or "").lower()
         hostname = host[1:].split("]")[0] if host.startswith("[") else host.rsplit(":", 1)[0]
         if hostname not in ("127.0.0.1", "localhost", "::1"):
-            return web.json_response({"error": "只允许本机访问"}, status=403)
+            return web.json_response({"error": tr("Local access only")}, status=403)
         # 页面和样式不含敏感信息，其余接口都要带令牌
         if not request.path.startswith(f"{manager_api.PREFIX}/manager"):
             token = request.headers.get("X-Relay-Token") or request.query.get("token") or ""
             if not self.token_ok(token):
-                return web.json_response({"error": "令牌不对，请重新打开管理器"}, status=403)
+                return web.json_response({"error": tr("Wrong token. Please reopen the manager")}, status=403)
         return await handler(request)
 
     async def live(self, request: web.Request) -> web.WebSocketResponse:
@@ -202,8 +203,10 @@ class ManagerServer:
 
     async def start(self) -> None:
         app = web.Application(middlewares=[self.guard])
+        app[manager_api.STANDALONE] = True
         routes = web.RouteTableDef()
         manager_api.add_routes(routes)
+        routes.post(f"{manager_api.PREFIX}/panel_edit")(manager_api.set_panel_edit)  # 只有这里能改这个开关
         routes.get(f"{manager_api.PREFIX}/live")(self.live)
         routes.get(f"{manager_api.PREFIX}/hello")(self.hello)
         routes.post(f"{manager_api.PREFIX}/quit")(self.quit)
@@ -269,10 +272,10 @@ def open_window(url: str) -> None:
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         subprocess.Popen([browser, f"--app={url}", "--window-size=1180,820", "--no-first-run",
                           "--no-default-browser-check"], creationflags=flags)
-        log.info("用 %s 打开管理器窗口", os.path.basename(browser))
+        log.info("Opening the manager window with %s", os.path.basename(browser))
     else:
         webbrowser.open(url)
-        log.info("没找到 Edge/Chrome，用默认浏览器打开")
+        log.info("Edge or Chrome not found, opening the default browser")
 
 
 # ---------- 单实例 ----------
@@ -322,7 +325,7 @@ async def _running_instance() -> str | None:
             if isinstance(data, dict) and data.get("app") == "relay-manager" and data.get("pid") == pid:
                 if data.get("code") == CODE_STAMP:
                     return f"{base}/manager/?token={token}"
-                log.info("管理器后台还在跑更新前的代码，换一个新的")
+                log.info("The running manager has code from before an update, replacing it")
                 await _retire(s, base, headers)
                 return _RETIRED
     except (aiohttp.ClientError, TimeoutError, ValueError):
@@ -377,7 +380,7 @@ async def run(port: int, show_window: bool) -> None:
             if existing == _RETIRED:
                 break
             if existing:
-                log.info("管理器已经在运行，再打开一个窗口")
+                log.info("The manager is already running, opening another window")
                 open_window(existing)
                 return
             if time.monotonic() >= deadline:
@@ -385,7 +388,7 @@ async def run(port: int, show_window: bool) -> None:
             await asyncio.sleep(0.3)  # 另一个进程正在启动，等它写好 instance.json
     server = ManagerServer(port=port)
     await server.start()
-    log.info("管理器已启动：http://127.0.0.1:%s%s/manager/", server.port, manager_api.PREFIX)
+    log.info("Manager started: http://127.0.0.1:%s%s/manager/", server.port, manager_api.PREFIX)
     if show_window:
         _write_instance(server)
         open_window(server.url)
@@ -399,20 +402,20 @@ async def run(port: int, show_window: bool) -> None:
         if show_window:
             _remove_instance(os.getpid())
         await server.stop()
-        log.info("管理器窗口已关闭，服务退出")
+        log.info("Manager window closed, exiting")
 
 
 def _show_fatal(message: str) -> None:
     """pythonw 没有控制台，出错时弹个对话框，不然用户只会看到「点了没反应」。"""
     if sys.platform == "win32":
         import ctypes
-        ctypes.windll.user32.MessageBoxW(None, message, "中转站管理器", 0x10)
+        ctypes.windll.user32.MessageBoxW(None, message, "Relay Manager", 0x10)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="中转站管理器")
-    parser.add_argument("--port", type=int, default=PREFERRED_PORT, help=f"监听端口，默认 {PREFERRED_PORT}，被占用会自动换")
-    parser.add_argument("--no-window", action="store_true", help="只启动服务，不打开窗口（调试用）")
+    parser = argparse.ArgumentParser(description="Relay Manager")
+    parser.add_argument("--port", type=int, default=PREFERRED_PORT, help=f"Port to listen on, {PREFERRED_PORT} by default. Another one is picked if it is taken")
+    parser.add_argument("--no-window", action="store_true", help="Start the service without opening a window (for debugging)")
     args = parser.parse_args()
 
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -428,9 +431,9 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        log.exception("管理器异常退出")
+        log.exception("Manager exited with an error")
         if not sys.stderr:
-            _show_fatal(f"中转站管理器出错了：{e}\n\n详细信息见 {log_path}")
+            _show_fatal(f"The relay manager hit an error: {e}\n\nDetails are in {log_path}")
         raise
 
 

@@ -10,17 +10,22 @@ import ipaddress
 import logging
 import os
 import time
+from urllib.parse import urlparse
 
 from aiohttp import web
 
 try:
     from . import relay_client as rc
+    from . import relay_i18n as i18n
     from . import relay_probe as rp
     from . import relay_store as rs
+    from .relay_i18n import tr
 except ImportError:  # 独立运行管理器时
     import relay_client as rc
+    import relay_i18n as i18n
     import relay_probe as rp
     import relay_store as rs
+    from relay_i18n import tr
 
 log = logging.getLogger("comfyui_relay_api")
 
@@ -33,9 +38,12 @@ STATIC_FILES = {
     "style.css": "text/css",
     "icon.svg": "image/svg+xml",
     "icon.ico": "image/x-icon",
+    "zh.json": "application/json",
 }
-CHAT_TEST_PROMPT = "这是连通性测试，请只回复两个字：收到"
+CHAT_TEST_PROMPT = "This is a connectivity test. Reply with just: OK"
 ALLOWED_HOSTS_ENV = "COMFY_RELAY_ALLOWED_HOSTS"  # 用域名访问 ComfyUI 时，把域名加到这里（逗号分隔）
+PROXY_HEADERS = ("X-Forwarded-For", "X-Real-IP", "Forwarded", "CF-Connecting-IP", "True-Client-IP")
+STANDALONE = web.AppKey("relay_standalone", bool)  # 独立管理器的服务上才有：它有一次性令牌，ComfyUI 的接口没有
 
 
 def _error(message: str, status: int = 400) -> web.Response:
@@ -62,15 +70,77 @@ def host_allowed(request: web.Request) -> bool:
     return hostname in extra
 
 
+def is_loopback(address: str | None) -> bool:
+    try:
+        ip = ipaddress.ip_address((address or "").split("%")[0])
+    except ValueError:
+        return False
+    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
+
+
+def is_local(request: web.Request) -> bool:
+    """请求是不是来自运行这个服务的电脑。经过反向代理的请求看起来像来自本机，所以带转发头的不算；
+    别的网页发来的也不算（Origin 和 Host 对不上，沙盒页面的 Origin 是 null）。"""
+    origin = request.headers.get("Origin")
+    if origin is not None and urlparse(origin).netloc.lower() != (request.host or "").lower():
+        return False
+    return not any(h in request.headers for h in PROXY_HEADERS) and is_loopback(request.remote)
+
+
+def panel_edit_enabled() -> bool:
+    try:
+        return rc.read_config().get(rs.PANEL_EDIT_KEY) is True
+    except rc.RelayError:
+        return False
+
+
+def can_edit(request: web.Request) -> bool:
+    """能不能改中转站、测试没保存的地址、让模型回话。这些决定提示词和令牌发到哪里、会不会花钱。
+    独立管理器有一次性令牌，随时能用。ComfyUI 的接口没有登录，内网穿透（frp、ssh -R）过来的请求也像来自本机，
+    所以默认不能用；用户在独立管理器里打开开关才行，这个开关存在磁盘上，ComfyUI 的接口改不了。"""
+    return is_local(request) and (request.app.get(STANDALONE, False) or panel_edit_enabled())
+
+
+def _local_only(fn):
+    """不影响数据去向的小操作（显示语言、通知页面刷新）：只要求来自本机。"""
+    async def wrapper(request: web.Request) -> web.StreamResponse:
+        if not is_local(request):
+            return _error(tr("This can only be done on the computer running ComfyUI"), 403)
+        return await fn(request)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+def _standalone_only(fn):
+    """让服务器访问请求里给的地址并返回结果。就算打开了侧边栏修改，ComfyUI 的接口也不做这个，只有带令牌的独立管理器能做。"""
+    async def wrapper(request: web.Request) -> web.StreamResponse:
+        if not request.app.get(STANDALONE, False) or not is_local(request):
+            return _error(tr("Testing an unsaved address is only available in the Relay Manager window"), 403)
+        return await fn(request)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+def _editable(fn):
+    """工作流只能按名字选中转站，碰不到这些接口。"""
+    async def wrapper(request: web.Request) -> web.StreamResponse:
+        if not can_edit(request):
+            return _error(tr("Relays can only be changed in the Relay Manager window (tools/start_manager in the "
+                             "plugin folder) or by editing relays.json"), 403)
+        return await fn(request)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
 async def _body(request: web.Request) -> dict:
     if request.content_type != "application/json":
-        raise rc.RelayError("请求格式不对（需要 JSON）")
+        raise rc.RelayError(tr("Bad request format (JSON required)"))
     try:
         data = await request.json()
     except Exception:
-        raise rc.RelayError("请求格式不对") from None
+        raise rc.RelayError(tr("Bad request format")) from None
     if not isinstance(data, dict):
-        raise rc.RelayError("请求格式不对")
+        raise rc.RelayError(tr("Bad request format"))
     return data
 
 
@@ -78,7 +148,7 @@ def _handled(fn):
     """校验 Host，把 RelayError 转成给界面看的错误信息；意外错误也返回 JSON，不让界面只看到 HTTP 500。"""
     async def wrapper(request: web.Request) -> web.StreamResponse:
         if not host_allowed(request):
-            return _error(f"中转站管理器只允许用 IP 或 localhost 访问（可用环境变量 {ALLOWED_HOSTS_ENV} 放行域名）", 403)
+            return _error(tr("The relay manager only accepts access by IP or localhost (allow a domain with the {env} environment variable)", env=ALLOWED_HOSTS_ENV), 403)
         try:
             return await fn(request)
         except rc.RelayError as e:
@@ -86,8 +156,8 @@ def _handled(fn):
         except web.HTTPException:
             raise
         except Exception as e:
-            log.exception("[中转站] 管理器接口出错：%s", request.path)
-            return _error(f"内部错误：{type(e).__name__}: {rc.short(str(e), 300)}", 500)
+            log.exception("[relay] manager route failed: %s", request.path)
+            return _error(tr("Internal error: {error}", error=f"{type(e).__name__}: {rc.short(str(e), 300)}"), 500)
     wrapper.__name__ = fn.__name__
     return wrapper
 
@@ -98,10 +168,41 @@ def _handled(fn):
 async def get_state(request: web.Request) -> web.Response:
     relays = rs.list_relays()
     placeholders = [r["name"] for r in relays if r["placeholder"]]
-    return web.json_response({"config_path": rc.config_path(), "relays": relays, "placeholders": placeholders})
+    local = is_local(request)  # 路径里常有用户名，不告诉别的电脑
+    script = "start_manager.bat" if os.name == "nt" else "start_manager.sh"
+    return web.json_response({
+        "config_path": rc.config_path() if local else "",
+        "start_script": os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", script) if local else "",
+        "can_edit": can_edit(request),
+        "standalone": request.app.get(STANDALONE, False),
+        "panel_edit": panel_edit_enabled(),
+        "relays": relays,
+        "placeholders": placeholders,
+    })
 
 
 @_handled
+@_standalone_only
+async def set_panel_edit(request: web.Request) -> web.Response:
+    """只注册在独立管理器的服务上（manager_app.py），ComfyUI 里没有这个接口。"""
+    rs.set_panel_edit((await _body(request)).get("enabled") is True)
+    return web.json_response({"ok": True})
+
+
+@_handled
+@_local_only
+async def set_language(request: web.Request) -> web.Response:
+    lang = (await _body(request)).get("lang")
+    if lang not in i18n.LANGUAGES:
+        raise rc.RelayError(tr("Unsupported language"))
+    if lang != i18n.language():
+        i18n.set_language(lang)
+        rp.clear()
+    return web.json_response({"ok": True})
+
+
+@_handled
+@_editable
 async def parse_text(request: web.Request) -> web.Response:
     data = await _body(request)
     existing = [r["name"] for r in rs.list_relays()]
@@ -109,6 +210,7 @@ async def parse_text(request: web.Request) -> web.Response:
 
 
 @_handled
+@_editable
 async def create_relay(request: web.Request) -> web.Response:
     data = await _body(request)
     view = rs.add_relay(str(data.get("name") or ""), str(data.get("base_url") or ""),
@@ -118,6 +220,7 @@ async def create_relay(request: web.Request) -> web.Response:
 
 
 @_handled
+@_editable
 async def update_relay(request: web.Request) -> web.Response:
     old_name = request.match_info["name"]
     data = await _body(request)
@@ -129,6 +232,7 @@ async def update_relay(request: web.Request) -> web.Response:
 
 
 @_handled
+@_editable
 async def delete_relay(request: web.Request) -> web.Response:
     name = request.match_info["name"]
     rs.delete_relay(name)
@@ -137,6 +241,7 @@ async def delete_relay(request: web.Request) -> web.Response:
 
 
 @_handled
+@_editable
 async def remove_placeholders(request: web.Request) -> web.Response:
     return web.json_response({"removed": rs.remove_placeholders()})
 
@@ -144,6 +249,7 @@ async def remove_placeholders(request: web.Request) -> web.Response:
 # ---------- 测试 / 模型 ----------
 
 @_handled
+@_standalone_only
 async def test_relay(request: web.Request) -> web.Response:
     """测试表单里还没保存的配置。令牌留空时可以沿用已保存的令牌，但必须还是同一个站点、没换代理。"""
     data = await _body(request)
@@ -152,20 +258,20 @@ async def test_relay(request: web.Request) -> web.Response:
     keep = data.get("keep_key_of")
     stored = rc.load_relays().get(str(keep)) if keep else None
     if keep and stored is None:
-        raise rc.RelayError(f"没有名为「{keep}」的中转站")
+        raise rc.RelayError(tr('No relay named "{name}"', name=keep))
     if stored is not None:  # 界面上显示的是遮挡过密码的地址，原样提交回来表示没改
         base_url = rs.unmask(base_url, str(stored.get("base_url") or ""))
         proxy = rs.unmask(proxy, str(stored.get("proxy") or ""))
     base_url, proxy = rs.check_base_url(base_url, api_key), rs.check_proxy(proxy)
     if not api_key and stored is not None:
         if not rs.can_reuse_key(stored, base_url, proxy):
-            raise rc.RelayError(rs.KEY_REQUIRED_MSG)
+            raise rc.RelayError(tr(rs.KEY_REQUIRED_MSG))
         api_key = str(stored.get("api_key") or "").strip()
         if rc._unfilled(api_key) and stored.get("api_key_env"):
             api_key = os.environ.get(str(stored["api_key_env"]), "").strip()
     if not api_key or rc._unfilled(api_key):
-        raise rc.RelayError("请填写令牌（API Key）")
-    relay = rc.Relay(str(data.get("name") or "未保存的中转站"), base_url, api_key, proxy or None)
+        raise rc.RelayError(tr("Please enter the token (API key)"))
+    relay = rc.Relay(str(data.get("name") or tr("Unsaved relay")), base_url, api_key, proxy or None)
     return web.json_response(await rp.probe(relay, refresh=True))
 
 
@@ -177,13 +283,14 @@ async def get_models(request: web.Request) -> web.Response:
 
 
 @_handled
+@_editable
 async def chat_test(request: web.Request) -> web.Response:
     """给文本模型发一句话，确认真的能用（花费极少）。"""
     data = await _body(request)
     relay = rc.get_relay(str(data.get("name") or ""))
     model = str(data.get("model") or "").strip()
     if not model:
-        raise rc.RelayError("缺少模型名")
+        raise rc.RelayError(tr("Model name is missing"))
     body = {"model": model, "messages": [{"role": "user", "content": CHAT_TEST_PROMPT}]}
     start = time.monotonic()
     text, _ = await rc.chat_completion(relay, body, timeout=90, check_interrupt=None)
@@ -208,7 +315,8 @@ async def manager_file(request: web.Request) -> web.StreamResponse:
     if name not in STATIC_FILES:
         raise web.HTTPNotFound()
     return web.FileResponse(os.path.join(MANAGER_DIR, name),
-                            headers={"Cache-Control": "no-cache", "Content-Type": STATIC_FILES[name]})
+                            headers={"Cache-Control": "no-cache", "Content-Type": STATIC_FILES[name],
+                                     "Content-Security-Policy": "frame-ancestors 'self'"})
 
 
 # ---------- 和 ComfyUI 画布联动 ----------
@@ -223,12 +331,12 @@ def clean_event(data: dict) -> dict:
     if kind == "relays-changed":
         return {"type": kind}
     if kind != "add-node":
-        raise rc.RelayError("不支持的通知类型")
+        raise rc.RelayError(tr("Unsupported notification type"))
     node, fmt, relay, model = (data.get(k) for k in ("node", "api_format", "relay", "model"))
     if not (isinstance(node, str) and node in NODE_TYPES and isinstance(relay, str) and isinstance(model, str)
             and relay and model and len(relay) <= 100 and len(model) <= 300
             and (fmt is None or (isinstance(fmt, str) and fmt in API_FORMATS))):
-        raise rc.RelayError("节点信息不完整")
+        raise rc.RelayError(tr("Incomplete node info"))
     return {"type": kind, "node": node, "relay": relay, "model": model, "api_format": fmt}
 
 
@@ -241,11 +349,12 @@ def add_comfy_routes(routes: web.RouteTableDef, send) -> None:
         return web.json_response({"ok": True, "app": "comfyui"})
 
     @_handled
+    @_local_only
     async def notify(request: web.Request) -> web.Response:
         event = clean_event(await _body(request))
         receivers = send(event)
         if not receivers and event["type"] == "add-node":
-            raise rc.RelayError("ComfyUI 正在运行，但没有打开的 ComfyUI 界面，打开后再试")
+            raise rc.RelayError(tr("ComfyUI is running but has no open interface. Open it and try again"))
         return web.json_response({"ok": True, "receivers": receivers})
 
     routes.get(f"{PREFIX}/ping")(ping)
@@ -255,6 +364,7 @@ def add_comfy_routes(routes: web.RouteTableDef, send) -> None:
 def add_routes(routes: web.RouteTableDef) -> None:
     """把管理器的接口注册到一个 RouteTableDef 上。"""
     routes.get(f"{PREFIX}/state")(get_state)
+    routes.post(f"{PREFIX}/language")(set_language)
     routes.post(f"{PREFIX}/parse")(parse_text)
     routes.post(f"{PREFIX}/relays")(create_relay)
     routes.put(f"{PREFIX}/relays/{{name}}")(update_relay)

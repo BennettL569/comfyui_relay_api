@@ -45,7 +45,9 @@ def prepare(base: str) -> str:
 
 
 def launch(comfy_dir: str, base: str, config: str, log_path: str) -> subprocess.Popen:
-    env = dict(os.environ, COMFY_RELAY_CONFIG=config, PYTHONIOENCODING="utf-8")
+    # 断言用的是中文原话，顺带核对翻译
+    env = dict(os.environ, COMFY_RELAY_CONFIG=config, COMFY_RELAY_LANG="zh", COMFY_RELAY_ALLOW_PRIVATE_DOWNLOADS="1",  # 模拟的第三方存储在本机
+               PYTHONIOENCODING="utf-8")
     log = open(log_path, "w", encoding="utf-8")
     return subprocess.Popen(
         [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", str(COMFY_PORT), "--cpu", "--disable-auto-launch",
@@ -155,7 +157,16 @@ async def main(comfy_dir: str) -> int:
                     assert node in info, f"{node} 没有注册，插件加载失败"
                 relay_spec = info["RelayAPI_Image"]["input"]["required"]["relay"]
                 assert relay_spec[1]["options"] == ["mock", "备用站"] or relay_spec[0] == ["mock", "备用站"], relay_spec
-                assert info["RelayAPI_Image"]["category"] == "中转站API"
+                assert info["RelayAPI_Image"]["category"] == "API Relay"
+                assert info["RelayAPI_Image"]["display_name"] == "Relay Image", "节点名默认英文，中文走语言包"
+                # 语言包要覆盖节点的每个输入和输出
+                with open(os.path.join(PLUGIN, "locales", "zh", "nodeDefs.json"), encoding="utf-8") as f:
+                    node_defs = json.load(f)
+                for node, names in node_defs.items():
+                    inputs = {**info[node]["input"]["required"], **info[node]["input"].get("optional", {})}
+                    missing = [k for k in inputs if k not in names["inputs"]]
+                    assert not missing, f"{node} 的语言包缺少 {missing}"
+                    assert len(names["outputs"]) == len(info[node]["output"]), node
             await case("节点注册与中转站下拉框", nodes_registered())
 
             async def chat():
@@ -302,6 +313,13 @@ async def main(comfy_dir: str) -> int:
                     data = await r.json()
                     assert r.status == 200 and [x["name"] for x in data["relays"]] == ["mock", "备用站"], data
                     assert KEY not in json.dumps(data), "接口里不能出现完整令牌"
+                    assert data["can_edit"] is False, "ComfyUI 的接口默认不能改配置"
+                async with s.post(f"{COMFY}/relay_api/relays", json={"name": "x", "base_url": "https://a.example.com", "api_key": "k"}) as r:
+                    assert r.status == 403, "ComfyUI 的接口默认不能改配置"
+                async with s.post(f"{COMFY}/relay_api/test", json={"base_url": "https://a.example.com", "api_key": "k"}) as r:
+                    assert r.status == 403, "ComfyUI 的接口默认不能访问请求里给的地址"
+                async with s.post(f"{COMFY}/relay_api/panel_edit", json={"enabled": True}) as r:
+                    assert r.status in (404, 405), "ComfyUI 里不能有打开这个开关的接口"
                 async with s.get(f"{COMFY}/relay_api/models/mock") as r:
                     data = await r.json()
                     assert data["ok"] and data["counts"]["image"] >= 2, data
@@ -315,7 +333,7 @@ async def main(comfy_dir: str) -> int:
                 async with s.get(f"{COMFY}/relay_api/state", headers={"Host": "evil.example.com"}) as r:
                     assert r.status == 403, "域名访问要被拒绝（防 DNS 重绑定）"
                 async with s.get(f"{COMFY}/relay_api/manager/") as r:
-                    assert r.status == 200 and "中转站管理器" in await r.text()
+                    assert r.status == 200 and "Relay Manager" in await r.text()
                 async with s.get(f"{COMFY}/extensions") as r:
                     exts = await r.json()
                     assert "/extensions/comfyui_relay_api/relay_manager.js" in exts and not any("manager/" in e for e in exts)

@@ -9,6 +9,35 @@ let frame = null;
 let panel = null; // 当前打开着的面板容器
 let parking = null; // 面板关着时 iframe 藏在这里
 let draft = null; // iframe 不得不重新加载时，暂存里面没保存的表单（只放内存）
+let lang = null;
+let catalog = {};
+
+function t(text, values) {
+  const template = catalog[text] ?? text;
+  return values ? template.replace(/\{(\w+)\}/g, (match, key) => (key in values ? values[key] : match)) : template;
+}
+
+const managerUrl = (path) => `${api.api_base ?? ""}/relay_api/${path}`;
+
+// 跟随 ComfyUI 的语言设置，并告诉后端：节点的报错和状态文字也用这个语言。语言变了返回 true
+async function syncLanguage() {
+  const locale = String(app.extensionManager?.setting?.get?.("Comfy.Locale") || "en").toLowerCase();
+  const next = locale.startsWith("zh") ? "zh" : "en";
+  if (next === lang) return false;
+  lang = next;
+  catalog = {};
+  try {
+    if (lang === "zh") catalog = await (await fetch(managerUrl("manager/zh.json"))).json();
+    await fetch(managerUrl("language"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lang }),
+    });
+  } catch (e) {
+    console.warn("[relay]", e);
+  }
+  return true;
+}
 
 function toast(severity, summary, detail = "") {
   app.extensionManager?.toast?.add({ severity, summary, detail, life: 4000 });
@@ -40,13 +69,13 @@ function addNode(spec) {
   const canvas = app.canvas;
   const graph = canvas?.graph ?? app.graph; // 在子图里时加到当前看到的子图
   const node = window.LiteGraph?.createNode(spec.node);
-  if (!node) throw new Error(`找不到节点类型 ${spec.node}，请重启 ComfyUI`);
+  if (!node) throw new Error(t("Node type {node} not found. Please restart ComfyUI", { node: spec.node }));
   const [vx, vy, vw, vh] = canvas.ds.visible_area;
   node.pos = [vx + vw / 2 - node.size[0] / 2, vy + vh / 2 - node.size[1] / 2];
   graph.add(node);
   if (!setWidget(node, "relay", spec.relay)) {
     graph.remove(node); // 不能悄悄换成别的中转站
-    throw new Error(`ComfyUI 里还没有中转站「${spec.relay}」，请在面板里刷新后再试`);
+    throw new Error(t("ComfyUI does not have relay \"{relay}\" yet. Refresh the panel and try again", { relay: spec.relay }));
   }
   setWidget(node, "model", spec.model);
   if (spec.api_format) setWidget(node, "api_format", spec.api_format);
@@ -63,7 +92,7 @@ async function handle(msg) {
     return null;
   }
   if (msg?.type === "add-node") {
-    if (!NODE_TYPES.includes(msg.node)) throw new Error("不支持的节点类型");
+    if (!NODE_TYPES.includes(msg.node)) throw new Error(t("Unsupported node type"));
     if (!relayOptions(msg.node)?.includes(msg.relay)) await refreshNodeDefinitions(); // 刚添加的中转站还不在下拉框里
     return addNode(msg);
   }
@@ -83,9 +112,9 @@ window.addEventListener("message", async (event) => {
     const node = await handle(msg);
     if (node) reply({ type: "add-node-result", ok: true, title: node.title || msg.node });
   } catch (e) {
-    console.error("[中转站]", e);
+    console.error("[relay]", e);
     if (msg.type === "add-node") reply({ type: "add-node-result", ok: false, error: e.message });
-    else toast("error", "中转站", e.message);
+    else toast("error", t("Relay"), e.message);
   }
 });
 
@@ -94,10 +123,10 @@ api.addEventListener("relay_api.event", async ({ detail }) => {
   try {
     const node = await handle(detail);
     if (detail?.type === "relays-changed") reply({ type: "reload" }); // 面板开着的话也刷新列表
-    if (node) toast("success", "中转站", `已添加节点：${node.title || detail.node}（${detail.model}）`);
+    if (node) toast("success", t("Relay"), t("Added node: {title} ({model})", { title: node.title || detail.node, model: detail.model }));
   } catch (e) {
-    console.error("[中转站]", e);
-    toast("error", "中转站", e.message);
+    console.error("[relay]", e);
+    toast("error", t("Relay"), e.message);
   }
 });
 
@@ -111,14 +140,14 @@ function keepDraft() {
     const win = frame?.contentWindow; // 已经销毁的 iframe 是 null，保留之前取到的
     if (win) draft = win.relayManager?.draft?.() ?? null;
   } catch (e) {
-    console.warn("[中转站]", e);
+    console.warn("[relay]", e);
   }
 }
 
 function createFrame() {
   const iframe = document.createElement("iframe");
-  iframe.src = `${api.api_base ?? ""}/relay_api/manager/?embedded=1`;
-  iframe.title = "中转站管理器";
+  iframe.src = managerUrl(`manager/?embedded=1&lang=${lang}`);
+  iframe.title = t("Relay Manager");
   iframe.style.cssText = "width:100%;height:100%;border:0;display:block;background:transparent";
   iframe.addEventListener("load", () => {
     if (!draft) return;
@@ -142,7 +171,7 @@ function attach(container, tries = 0) {
       container.moveBefore(frame, null);
       return;
     } catch (e) {
-      console.warn("[中转站]", e);
+      console.warn("[relay]", e);
     }
   }
   keepDraft();
@@ -161,7 +190,7 @@ function park() {
       parking.moveBefore(frame, null);
       return;
     } catch (e) {
-      console.warn("[中转站]", e);
+      console.warn("[relay]", e);
     }
   }
   keepDraft(); // iframe 会跟着面板一起销毁
@@ -169,18 +198,28 @@ function park() {
 
 app.registerExtension({
   name: "comfyui_relay_api.Manager",
-  setup() {
+  // 在 ComfyUI 读节点定义之前告诉后端语言：中转站下拉框里的提示文字是后端给的
+  init: syncLanguage,
+  async setup() {
+    await syncLanguage();
     app.extensionManager?.registerSidebarTab?.({
       id: TAB_ID,
       icon: "pi pi-link",
-      title: "中转站",
-      tooltip: "中转站管理器：添加第三方 API、测试连接、把模型节点加到画布",
+      title: t("Relay"),
+      tooltip: t("Relay Manager: add third-party APIs, test connections and add model nodes to the canvas"),
       type: "custom",
       render: (container) => {
         container.style.height = "100%";
         panel = container;
         frame ??= createFrame();
         attach(container);
+        // ComfyUI 的语言改过的话，下次打开面板时换成新语言
+        syncLanguage().then((changed) => {
+          if (changed && frame) {
+            keepDraft();
+            frame.src = managerUrl(`manager/?embedded=1&lang=${lang}`);
+          }
+        });
       },
       destroy: () => {
         // 面板关掉前（容器还在页面里）把 iframe 藏起来，下次打开原样挪回去

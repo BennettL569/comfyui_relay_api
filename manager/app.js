@@ -5,16 +5,41 @@ const EMBEDDED = params.get("embedded") === "1" && window.parent !== window;
 const root = document.documentElement;
 if (EMBEDDED) root.classList.add("embedded");
 
-const KIND_LABEL = { text: "文本", image: "图片", video: "视频", other: "其他" };
+// 默认英文。侧边栏里跟随 ComfyUI 的语言设置（web/relay_manager.js 传进来），独立窗口用右上角的开关
+const LANG_KEY = "relay-manager-lang";
+function storedLang() {
+  try {
+    return localStorage.getItem(LANG_KEY);
+  } catch {
+    return null;
+  }
+}
+const LANG = (EMBEDDED ? params.get("lang") : storedLang()) === "zh" ? "zh" : "en";
+root.lang = LANG;
+let catalog = {};
+if (LANG === "zh") {
+  try {
+    catalog = await (await fetch("zh.json")).json();
+  } catch {
+    /* 翻译读不到就显示英文 */
+  }
+}
+
+function t(text, values) {
+  const template = catalog[text] ?? text;
+  return values ? template.replace(/\{(\w+)\}/g, (match, key) => (key in values ? values[key] : match)) : template;
+}
+
+const KIND_LABEL = { text: t("Text"), image: t("Image"), video: t("Video"), other: t("Other") };
 const FORMAT_LABEL = {
-  images: "OpenAI 图像接口",
-  "images-json": "图像接口·JSON 参考图",
-  chat: "对话接口",
-  gemini: "Gemini 原生",
-  unified: "统一视频接口",
-  openai: "Sora 格式",
-  custom: "自定义路径",
-  task: "任务插件接口",
+  images: t("OpenAI image API"),
+  "images-json": t("Image API with JSON references"),
+  chat: t("Chat API"),
+  gemini: t("Native Gemini"),
+  unified: t("Unified video API"),
+  openai: t("Sora format"),
+  custom: t("Custom paths"),
+  task: t("Task plugin API"),
 };
 const NODE_FOR_KIND = { text: "RelayAPI_Chat", image: "RelayAPI_Image", video: "RelayAPI_Video" };
 const MAX_ROWS = 300;
@@ -22,6 +47,10 @@ const TEXT_INPUT = { spellcheck: false, autocomplete: "off", autocapitalize: "of
 
 const state = {
   configPath: "",
+  canEdit: true,
+  standalone: false,
+  panelEdit: false,
+  startScript: "",
   loadError: "",
   relays: [],
   placeholders: [],
@@ -71,7 +100,7 @@ async function api(path, { method = "GET", body } = {}) {
   try {
     res = await fetch(`../${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
   } catch {
-    throw new Error(TOKEN ? "连不上管理器后台，请重新打开管理器" : "连不上 ComfyUI，请确认 ComfyUI 还在运行");
+    throw new Error(TOKEN ? t("Cannot reach the manager backend. Please reopen the manager") : t("Cannot reach ComfyUI. Please check it is still running"));
   }
   let data = null;
   try {
@@ -79,7 +108,7 @@ async function api(path, { method = "GET", body } = {}) {
   } catch {
     /* 非 JSON 响应 */
   }
-  if (!res.ok || data?.error) throw new Error(data?.error || `请求失败（HTTP ${res.status}）`);
+  if (!res.ok || data?.error) throw new Error(data?.error || t("Request failed (HTTP {status})", { status: res.status }));
   return data;
 }
 
@@ -91,7 +120,7 @@ function toast(text, kind = "") {
 
 // 确认框自己画，不用原生 confirm()：Comfy Desktop（Electron）在 Windows 上弹过原生对话框后，
 // 输入框常常打不了字，弹框期间整个 ComfyUI 页面也会卡住
-function askConfirm(message, okText = "确定", danger = false) {
+function askConfirm(message, okText = t("OK"), danger = false) {
   return new Promise((resolve) => {
     const previous = document.activeElement;
     const behind = [...document.body.children].filter((node) => node.id !== "toasts");
@@ -101,7 +130,7 @@ function askConfirm(message, okText = "确定", danger = false) {
       previous?.focus?.();
       resolve(answer);
     };
-    const cancel = el("button", { class: "btn", onclick: () => finish(false) }, "取消");
+    const cancel = el("button", { class: "btn", onclick: () => finish(false) }, t("Cancel"));
     const mask = el("div", {
       class: "modal-mask",
       onkeydown: (e) => {
@@ -136,7 +165,7 @@ async function copyText(text) {
     document.execCommand("copy");
     area.remove();
   }
-  toast(`已复制：${text}`, "ok");
+  toast(t("Copied: {text}", { text }), "ok");
 }
 
 function postToComfy(message) {
@@ -185,8 +214,8 @@ async function loadState({ quiet = false } = {}) {
     return;
   }
   // 定时刷新时没变化就不重画，免得打断正在进行的点击
-  if (quiet && !state.loadError && JSON.stringify([data.relays, data.placeholders])
-    === JSON.stringify([state.relays, state.placeholders])) return;
+  if (quiet && !state.loadError && JSON.stringify([data.relays, data.placeholders, data.can_edit, data.panel_edit])
+    === JSON.stringify([state.relays, state.placeholders, state.canEdit, state.panelEdit])) return;
   // 别处（侧边栏 / 独立窗口 / 手动编辑）改过的中转站，旧的测试结果作废
   const before = new Map(state.relays.map((r) => [r.name, r]));
   for (const relay of data.relays) {
@@ -200,6 +229,10 @@ async function loadState({ quiet = false } = {}) {
 
   state.loadError = "";
   state.configPath = data.config_path;
+  state.canEdit = data.can_edit !== false;
+  state.standalone = data.standalone === true;
+  state.panelEdit = data.panel_edit === true;
+  state.startScript = data.start_script || "";
   state.relays = data.relays;
   state.placeholders = data.placeholders || [];
   if (state.selected && !state.relays.some((r) => r.name === state.selected)) state.selected = null;
@@ -230,7 +263,7 @@ async function probe(name, force = false) {
 }
 
 async function leaveForm() {
-  if (state.view === "form" && state.form?.dirty && !(await askConfirm("放弃没保存的修改吗？", "放弃", true))) return false;
+  if (state.view === "form" && state.form?.dirty && !(await askConfirm(t("Discard unsaved changes?"), t("Discard"), true))) return false;
   state.form = null;
   state.view = "detail";
   return true;
@@ -250,12 +283,12 @@ async function select(name) {
 // ---------- 渲染 ----------
 
 function statusChip(relay, result) {
-  if (state.probing.has(relay.name)) return el("span", { class: "chip" }, el("span", { class: "spinner" }), "测试中");
-  if (!relay.configured) return el("span", { class: "chip warn" }, "未配置");
-  if (result?.ok && !result.models.length) return el("span", { class: "chip warn" }, "● 没有模型");
-  if (result?.ok) return el("span", { class: "chip ok" }, "● 正常");
-  if (result) return el("span", { class: "chip err" }, "● 出错");
-  return el("span", { class: "chip" }, "未测试");
+  if (state.probing.has(relay.name)) return el("span", { class: "chip" }, el("span", { class: "spinner" }), t("Testing"));
+  if (!relay.configured) return el("span", { class: "chip warn" }, t("Not set up"));
+  if (result?.ok && !result.models.length) return el("span", { class: "chip warn" }, t("● No models"));
+  if (result?.ok) return el("span", { class: "chip ok" }, t("● OK"));
+  if (result) return el("span", { class: "chip err" }, t("● Error"));
+  return el("span", { class: "chip" }, t("Not tested"));
 }
 
 function render() {
@@ -263,7 +296,8 @@ function render() {
   const active = document.activeElement;
   const searchFocus = active?.dataset?.role === "model-search" ? [active.selectionStart, active.selectionEnd] : null;
 
-  document.getElementById("cfgPath").textContent = state.configPath ? `配置文件：${state.configPath}` : "";
+  document.getElementById("cfgPath").textContent = state.configPath ? t("Config file: {path}", { path: state.configPath }) : "";
+  document.getElementById("btnAdd").hidden = !state.canEdit;
   renderBanner();
   renderList();
   const detail = document.getElementById("detail");
@@ -287,14 +321,14 @@ function renderBanner() {
   const box = document.getElementById("banner");
   box.replaceChildren();
   if (state.backendDown) {
-    box.append(el("div", { class: "banner" }, el("span", {}, "管理器后台已经退出了，请重新打开管理器。")));
+    box.append(el("div", { class: "banner" }, el("span", {}, t("The manager backend has exited. Please reopen the manager."))));
     return;
   }
   if (!state.placeholders.length) return;
   box.append(
     el("div", { class: "banner" },
-      el("span", {}, `配置里有 ${state.placeholders.length} 个还没填写的示例中转站（${state.placeholders.join("、")}）。`),
-      el("button", { class: "btn small", onclick: removePlaceholders }, "删掉示例")),
+      el("span", {}, t("The config has {count} example relays that are not filled in ({names}).", { count: state.placeholders.length, names: state.placeholders.join(", ") })),
+      state.canEdit ? el("button", { class: "btn small", onclick: removePlaceholders }, t("Remove examples")) : null),
   );
 }
 
@@ -304,65 +338,89 @@ function renderList() {
   if (state.loadError) {
     box.append(
       el("div", { class: "card result err" },
-        el("div", { class: "title" }, "读取配置失败"),
+        el("div", { class: "title" }, t("Cannot read the config")),
         el("div", {}, state.loadError),
-        el("div", { class: "note" }, "如果是手动改坏了 relays.json，可以改正后点重新加载；上一次保存的版本在同目录的 relays.json.bak。"),
-        el("div", { class: "actions", style: "margin-top:8px" }, el("button", { class: "btn small", onclick: loadState }, "重新加载"))),
+        el("div", { class: "note" }, t("If relays.json was broken by a manual edit, fix it and reload. The last saved version is relays.json.bak in the same folder.")),
+        el("div", { class: "actions", style: "margin-top:8px" }, el("button", { class: "btn small", onclick: loadState }, t("Reload")))),
     );
     return;
   }
   if (!state.relays.length) {
     box.append(
       el("div", { class: "card empty" },
-        el("div", { class: "big" }, "还没有中转站"),
-        el("div", { class: "muted" }, "点「添加中转站」，把站点给你的地址和令牌整段粘贴进来就行。")),
+        el("div", { class: "big" }, t("No relays yet")),
+        el("div", { class: "muted" }, state.canEdit ? t("Click Add relay and paste the address and token your relay gave you.") : readOnlyHint())),
     );
+    if (state.standalone) box.append(panelEditToggle());
     return;
   }
   const configured = state.relays.filter((r) => r.configured);
   if (configured.length > 1) {
     box.append(
       el("div", { class: "actions", style: "margin-bottom:10px" },
-        el("button", { class: "btn small", onclick: () => configured.forEach((r) => probe(r.name, true)) }, "全部测试")),
+        el("button", { class: "btn small", onclick: () => configured.forEach((r) => probe(r.name, true)) }, t("Test all"))),
     );
   }
   for (const relay of state.relays) {
     const result = state.probes[relay.name];
-    let counts = relay.configured ? "点击查看并测试连接" : "还没填写地址和令牌";
-    if (result?.ok) counts = `文本 ${result.counts.text} · 图片 ${result.counts.image} · 视频 ${result.counts.video}`;
-    else if (result) counts = "连接失败，点开看原因";
+    let counts = relay.configured ? t("Click to view and test") : t("Address and token not filled in");
+    if (result?.ok) counts = t("Text {text} · Image {image} · Video {video}", result.counts);
+    else if (result) counts = t("Connection failed, click for details");
     const active = state.view === "detail" && state.selected === relay.name;
     box.append(
       el("div", { class: `card relay${active ? " active" : ""}`, onclick: () => select(relay.name) },
         el("div", { class: "row" }, el("div", { class: "name", title: relay.name }, relay.name), statusChip(relay, result)),
-        el("div", { class: "host", title: relay.base_url }, relay.url_filled ? hostOf(relay.base_url) : "（未填写接口地址）"),
+        el("div", { class: "host", title: relay.base_url }, relay.url_filled ? hostOf(relay.base_url) : t("(API address not filled in)")),
         el("div", { class: "counts" }, counts)),
     );
   }
+  if (state.standalone) box.append(panelEditToggle());
+}
+
+function readOnlyHint() {
+  const script = state.startScript;
+  if (!script) return t("To add or change relays, run tools/start_manager on the computer running ComfyUI, or edit relays.json there by hand.");
+  const windows = script.toLowerCase().endsWith(".bat");
+  const command = windows ? script : `sh "${script}"`;
+  return el("div", {},
+    el("div", {}, t("To add or change relays, open the Relay Manager window by running this:")),
+    el("div", { class: "mono", style: "margin:6px 0;overflow-wrap:anywhere" }, command),
+    el("button", { class: "btn small", onclick: () => copyText(command) }, windows ? t("Copy path") : t("Copy command")),
+    el("div", { style: "margin-top:6px" }, windows
+      ? t("Paste it into the File Explorer address bar or the Run box (Win+R) and press Enter. You can also edit relays.json by hand.")
+      : t("Run it in a terminal. You can also edit relays.json by hand.")));
+}
+
+function panelEditToggle() {
+  return el("label", { class: "note", style: "display:flex;gap:8px;align-items:flex-start;cursor:pointer;margin-top:12px" },
+    el("input", { type: "checkbox", checked: state.panelEdit, style: "width:auto;margin:2px 0 0", onchange: (e) => setPanelEdit(e.target.checked) }),
+    el("span", {},
+      el("div", {}, t("Allow changing relays in the ComfyUI sidebar")),
+      el("div", { class: "muted" }, t("Off by default. When it is on, anything that reaches ComfyUI from this computer, such as a tunnel, could change where your prompts go."))));
 }
 
 function renderDetail(box) {
   if (state.loadError) return;
   const relay = state.relays.find((r) => r.name === state.selected);
   if (!relay) {
-    box.append(el("div", { class: "card empty muted" }, state.relays.length ? "在左边选一个中转站" : "添加中转站后，这里会显示它的模型"));
+    box.append(el("div", { class: "card empty muted" }, state.relays.length ? t("Choose a relay on the left") : t("Its models show here after you add a relay")));
     return;
   }
   const result = state.probes[relay.name];
   const busy = state.probing.has(relay.name);
   const info = [
-    el("dt", {}, "接口地址"), el("dd", { class: "mono" }, relay.url_filled ? relay.base_url : "未填写"),
-    el("dt", {}, "令牌"), el("dd", { class: "mono" }, relay.key_masked || (relay.api_key_env ? `环境变量 ${relay.api_key_env}` : "未填写")),
-    el("dt", {}, "代理"), el("dd", {}, relay.proxy || "不使用"),
+    el("dt", {}, t("API address")), el("dd", { class: "mono" }, relay.url_filled ? relay.base_url : t("Not filled in")),
+    el("dt", {}, t("Token")), el("dd", { class: "mono" }, relay.key_masked || (relay.api_key_env ? t("Environment variable {name}", { name: relay.api_key_env }) : t("Not filled in"))),
+    el("dt", {}, t("Proxy")), el("dd", {}, relay.proxy || t("None")),
   ];
   const software = result?.software;
   if (software?.site_name && software.site_name !== software.name) {
-    info.push(el("dt", {}, "站点名称"), el("dd", {}, software.site_name));
+    info.push(el("dt", {}, t("Site name")), el("dd", {}, software.site_name));
   }
   if (software?.name) {
-    info.push(el("dt", {}, "站点程序"), el("dd", {}, `${software.name} ${software.version || ""}`.trim()));
+    info.push(el("dt", {}, t("Site software")), el("dd", {}, `${software.name} ${software.version || ""}`.trim()));
   }
-  if (result?.ok) info.push(el("dt", {}, "响应耗时"), el("dd", {}, `${result.latency_ms} ms`));
+  if (result?.ok) info.push(el("dt", {}, t("Response time")), el("dd", {}, `${result.latency_ms} ms`));
 
   box.append(
     el("div", { class: "card" },
@@ -371,22 +429,25 @@ function renderDetail(box) {
       el("dl", { class: "info-grid" }, info),
       el("div", { class: "actions" },
         el("button", { class: "btn primary", disabled: busy || !relay.configured, onclick: () => probe(relay.name, true) },
-          busy ? [el("span", { class: "spinner" }), " 测试中"] : "测试连接"),
-        el("button", { class: "btn", onclick: () => openForm("edit", relay) }, relay.configured ? "编辑" : "填写"),
-        el("button", { class: "btn danger", onclick: () => removeRelay(relay) }, "删除")),
-      result && !result.ok ? el("div", { class: "result err" }, el("div", { class: "title" }, "连接失败"), result.error) : null,
-      result?.ok && result.warnings?.length ? el("div", { class: "note" }, result.warnings.join("；")) : null,
+          busy ? [el("span", { class: "spinner" }), " ", t("Testing")] : t("Test connection")),
+        state.canEdit ? el("button", { class: "btn", onclick: () => openForm("edit", relay) }, relay.configured ? t("Edit") : t("Fill in")) : null,
+        state.canEdit ? el("button", { class: "btn danger", onclick: () => removeRelay(relay) }, t("Delete")) : null),
+      state.canEdit ? null : el("details", { class: "note" },
+        el("summary", { style: "cursor:pointer" }, t("To change this relay, open the Relay Manager window")),
+        el("div", { style: "margin-top:6px" }, readOnlyHint())),
+      result && !result.ok ? el("div", { class: "result err" }, el("div", { class: "title" }, t("Connection failed")), result.error) : null,
+      result?.ok && result.warnings?.length ? el("div", { class: "note" }, result.warnings.join("; ")) : null,
       result?.ok ? renderModels(relay, result) : null,
       EMBEDDED ? null : el("div", { class: "note" }, state.comfy.running
-        ? `已连接到正在运行的 ComfyUI（端口 ${state.comfy.port}），这里的修改会自动同步到节点的「中转站」下拉框。`
-        : "没检测到正在运行的 ComfyUI。启动 ComfyUI 后（Comfy Desktop 要用本地实例，Comfy Cloud 装不了插件），节点的「中转站」下拉框里就能选到这里配置的站。")),
+        ? t("Connected to the running ComfyUI (port {port}). Changes here sync to the relay list on the nodes.", { port: state.comfy.port })
+        : t("No running ComfyUI detected. Once ComfyUI is running (a local instance on Comfy Desktop; Comfy Cloud cannot load plugins), the relays configured here appear in the relay list on the nodes."))),
   );
 }
 
 function renderModels(relay, result) {
   if (!result.models.length) {
-    return el("div", { class: "result err" }, el("div", { class: "title" }, "站点没有返回任何模型"),
-      "可能是这个令牌没有分组权限，或者站点还没上架模型，去站点后台看看令牌设置。");
+    return el("div", { class: "result err" }, el("div", { class: "title" }, t("The relay returned no models")),
+      t("The token may lack group permissions, or the relay has no models listed yet. Check the token settings in the relay's console."));
   }
   const list = el("div", { class: "models", style: "margin-top:10px" });
   const refresh = () => {
@@ -395,14 +456,14 @@ function renderModels(relay, result) {
       (m) => (state.filter === "all" || m.kind === state.filter) && (!query || m.id.toLowerCase().includes(query)),
     );
     const rows = items.slice(0, MAX_ROWS).map((m) => modelRow(relay, m));
-    if (!rows.length) rows.push(el("div", { class: "empty muted" }, "没有匹配的模型"));
-    if (items.length > MAX_ROWS) rows.push(el("div", { class: "empty muted" }, `还有 ${items.length - MAX_ROWS} 个，用搜索缩小范围`));
+    if (!rows.length) rows.push(el("div", { class: "empty muted" }, t("No matching models")));
+    if (items.length > MAX_ROWS) rows.push(el("div", { class: "empty muted" }, t("{count} more. Use the search to narrow them down", { count: items.length - MAX_ROWS })));
     list.replaceChildren(...rows);
   };
   const search = el("input", {
     ...TEXT_INPUT,
     "data-role": "model-search",
-    placeholder: "搜索模型名，例如 banana、sora、gpt",
+    placeholder: t("Search model names, such as banana, sora, gpt"),
     value: state.search,
     oninput: (e) => {
       state.search = e.target.value;
@@ -417,16 +478,16 @@ function renderModels(relay, result) {
           state.filter = kind;
           render();
         },
-      }, kind === "all" ? `全部 ${result.models.length}` : `${KIND_LABEL[kind]} ${result.counts[kind] ?? 0}`)),
+      }, kind === "all" ? `${t("All")} ${result.models.length}` : `${KIND_LABEL[kind]} ${result.counts[kind] ?? 0}`)),
   );
   refresh();
   return el("div", {},
-    el("h3", {}, "模型"),
+    el("h3", {}, t("Models")),
     el("div", { class: "toolbar" }, search),
     filters,
     list,
     canvasAvailable()
-      ? el("div", { class: "note" }, "「添加到画布」会在 ComfyUI 画布中间放一个配好的节点，接口格式按推荐的来，不对可以在节点上再改。")
+      ? el("div", { class: "note" }, t("Add to canvas places a configured node in the middle of the ComfyUI canvas with the recommended API format. You can change the format on the node if it does not work."))
       : null,
   );
 }
@@ -435,14 +496,14 @@ function modelRow(relay, model) {
   const key = `${relay.name}|${model.id}`;
   const reply = state.replies[key];
   const actions = el("div", { class: "actions" });
-  if (model.kind === "text") {
+  if (model.kind === "text" && state.canEdit) {
     actions.append(el("button", { class: "btn small", disabled: reply?.busy, onclick: () => chatTest(relay, model) },
-      reply?.busy ? "测试中…" : "测一下"));
+      reply?.busy ? t("Testing…") : t("Try it")));
   }
   if (canvasAvailable() && NODE_FOR_KIND[model.kind]) {
-    actions.append(el("button", { class: "btn small primary", onclick: () => addToCanvas(relay, model) }, "添加到画布"));
+    actions.append(el("button", { class: "btn small primary", onclick: () => addToCanvas(relay, model) }, t("Add to canvas")));
   }
-  actions.append(el("button", { class: "btn small", onclick: () => copyText(model.id) }, "复制"));
+  actions.append(el("button", { class: "btn small", onclick: () => copyText(model.id) }, t("Copy")));
   return el("div", { class: "model" },
     el("div", { class: "id", title: model.id }, model.id),
     el("div", { class: "meta" },
@@ -450,7 +511,7 @@ function modelRow(relay, model) {
       model.api_format
         ? el("span", {
           class: "chip",
-          title: [model.reason, model.endpoint_types?.length ? `站点标注：${model.endpoint_types.join("、")}` : ""]
+          title: [model.reason, model.endpoint_types?.length ? t("Marked by the relay: {types}", { types: model.endpoint_types.join(", ") }) : ""]
             .filter(Boolean).join("\n"),
         }, FORMAT_LABEL[model.api_format] || model.api_format)
         : null),
@@ -467,7 +528,7 @@ async function chatTest(relay, model) {
   render();
   try {
     const res = await api("chat_test", { method: "POST", body: { name: relay.name, model: model.id } });
-    state.replies[key] = { ok: true, text: `${res.reply || "（空回复）"}（${res.latency_ms} ms）` };
+    state.replies[key] = { ok: true, text: `${res.reply || t("(empty reply)")} (${res.latency_ms} ms)` };
   } catch (e) {
     state.replies[key] = { ok: false, text: e.message };
   }
@@ -488,18 +549,29 @@ async function addToCanvas(relay, model) {
   }
   try {
     await api("comfy/notify", { method: "POST", body: message });
-    toast(`已发送到 ComfyUI 画布：${model.id}`, "ok");
+    toast(t("Sent to the ComfyUI canvas: {model}", { model: model.id }), "ok");
   } catch (e) {
     toast(e.message, "err");
     checkComfy();
   }
 }
 
+async function setPanelEdit(enabled) {
+  try {
+    await api("panel_edit", { method: "POST", body: { enabled } });
+    state.panelEdit = enabled;
+    notifyChanged();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+  render();
+}
+
 async function removeRelay(relay) {
-  if (!(await askConfirm(`确定删除中转站「${relay.name}」吗？用到它的工作流需要重新选择中转站。`, "删除", true))) return;
+  if (!(await askConfirm(t("Delete relay \"{name}\"? Workflows that use it will need another relay.", { name: relay.name }), t("Delete"), true))) return;
   try {
     await api(`relays/${encodeURIComponent(relay.name)}`, { method: "DELETE" });
-    toast(`已删除「${relay.name}」`, "ok");
+    toast(t("Deleted \"{name}\"", { name: relay.name }), "ok");
     invalidate(relay.name);
     state.selected = null;
     notifyChanged();
@@ -512,7 +584,7 @@ async function removeRelay(relay) {
 async function removePlaceholders() {
   try {
     const res = await api("placeholders/remove", { method: "POST" });
-    toast(res.removed.length ? `已删除：${res.removed.join("、")}` : "没有需要删除的示例", "ok");
+    toast(res.removed.length ? t("Deleted: {names}", { names: res.removed.join(", ") }) : t("No examples to delete"), "ok");
     notifyChanged();
     await loadState();
   } catch (e) {
@@ -560,7 +632,7 @@ function buildForm(form, relay) {
   let timer = null;
   refs.paste = el("textarea", {
     ...TEXT_INPUT,
-    placeholder: "把站点给你的地址和令牌整段粘贴到这里",
+    placeholder: t("Paste the address and token your relay gave you here"),
     oninput: (e) => {
       form.dirty = true;
       clearTimeout(timer);
@@ -571,28 +643,29 @@ function buildForm(form, relay) {
 
   refs.key = input("api_key", {
     type: "password",
-    placeholder: form.hasKey ? `留空则沿用原令牌（${relay.key_masked || `环境变量 ${relay.api_key_env}`}）` : "sk-...",
+    placeholder: form.hasKey ? t("Leave empty to keep the current token ({token})", { token: relay.key_masked || t("Environment variable {name}", { name: relay.api_key_env }) }) : "sk-...",
   });
   const toggle = el("button", {
     class: "btn",
     type: "button",
     onclick: () => {
       refs.key.type = refs.key.type === "password" ? "text" : "password";
-      toggle.textContent = refs.key.type === "password" ? "显示" : "隐藏";
+      toggle.textContent = refs.key.type === "password" ? t("Show") : t("Hide");
     },
-  }, "显示");
+  }, t("Show"));
 
   refs.status = el("div");
-  refs.test = el("button", { class: "btn", onclick: () => testForm(form) }, "测试连接");
-  refs.save = el("button", { class: "btn primary", onclick: () => saveForm(form) }, form.mode === "add" ? "保存" : "保存修改");
+  refs.test = el("button", { class: "btn", onclick: () => testForm(form) }, t("Test connection"));
+  refs.save = el("button", { class: "btn primary", onclick: () => saveForm(form) }, form.mode === "add" ? t("Save") : t("Save changes"));
 
+  if (!state.standalone) refs.test.hidden = true; // 测试没保存的地址只有独立窗口能做；在这里保存后会自动测试
   return el("div", { class: "card" },
-    el("h2", {}, form.mode === "add" ? "添加中转站" : `编辑「${relay.name}」`),
-    form.hasKey ? null : field("快速粘贴", refs.paste, "例如：接口地址 https://api.xxx.com/v1  令牌 sk-xxxx，会自动识别并填好下面的格子"),
-    field("名称", input("name", { placeholder: "随便起，例如 closeai、备用站" }), "会显示在节点的「中转站」下拉框里"),
-    field("接口地址", input("base_url", { placeholder: "https://api.xxx.com/v1" }), "带不带 /v1 都行，误粘了 /chat/completions 也会自动去掉"),
-    field("令牌（API Key）", el("div", { class: "key-row" }, refs.key, toggle)),
-    field("代理（可选）", input("proxy", { placeholder: "需要代理才能访问时填，例如 http://127.0.0.1:7890" })),
+    el("h2", {}, form.mode === "add" ? t("Add relay") : t("Edit \"{name}\"", { name: relay.name })),
+    form.hasKey ? null : field(t("Quick paste"), refs.paste, t("For example: API address https://api.xxx.com/v1  token sk-xxxx. The fields below fill in automatically")),
+    field(t("Name"), input("name", { placeholder: t("Anything you like, such as closeai or backup") }), t("Shown in the relay list on the nodes")),
+    field(t("API address"), input("base_url", { placeholder: "https://api.xxx.com/v1" }), t("With or without /v1. A pasted /chat/completions is removed automatically")),
+    field(t("Token (API key)"), el("div", { class: "key-row" }, refs.key, toggle)),
+    field(t("Proxy (optional)"), input("proxy", { placeholder: t("Only if you need one to reach the relay, such as http://127.0.0.1:7890") })),
     el("div", { class: "actions" },
       refs.test,
       refs.save,
@@ -601,7 +674,7 @@ function buildForm(form, relay) {
         onclick: async () => {
           if (await leaveForm()) render();
         },
-      }, "取消")),
+      }, t("Cancel"))),
     refs.status,
   );
 }
@@ -614,15 +687,15 @@ async function quickParse(form, text) {
     const found = [];
     if (parsed.base_url) {
       v.base_url = parsed.base_url;
-      found.push("接口地址");
+      found.push(t("API address"));
     }
     if (parsed.api_key) {
       v.api_key = parsed.api_key;
-      found.push("令牌");
+      found.push(t("Token"));
     }
     if (parsed.proxy) {
       v.proxy = parsed.proxy;
-      found.push("代理");
+      found.push(t("Proxy"));
     }
     if (parsed.name && (form.autoName || !v.name)) {
       v.name = parsed.name;
@@ -631,10 +704,10 @@ async function quickParse(form, text) {
     for (const key of ["name", "base_url", "proxy"]) form.refs[key].value = v[key];
     form.refs.key.value = v.api_key;
     setFormStatus(form, found.length
-      ? { ok: true, title: `已识别：${found.join("、")}`, detail: "检查一下没问题就可以测试连接或直接保存" }
-      : { ok: false, title: "没识别出地址或令牌", detail: "可以直接在下面的格子里手动填写" });
+      ? { ok: true, title: t("Detected: {items}", { items: found.join(", ") }), detail: state.standalone ? t("Check them, then test the connection or save") : t("Check them, then save") }
+      : { ok: false, title: t("No address or token detected"), detail: t("You can fill in the fields below by hand") });
   } catch (e) {
-    setFormStatus(form, { ok: false, title: "识别失败", detail: e.message });
+    setFormStatus(form, { ok: false, title: t("Detection failed"), detail: e.message });
   }
 }
 
@@ -652,27 +725,27 @@ function setBusy(form, busy, label) {
 }
 
 async function testForm(form) {
-  setBusy(form, true, "正在测试连接…");
+  setBusy(form, true, t("Testing the connection…"));
   try {
     const res = await api("test", {
       method: "POST",
       body: { ...form.values, keep_key_of: form.mode === "edit" ? form.original : null },
     });
     if (res.ok && !res.models.length) {
-      setFormStatus(form, { ok: false, title: "连上了，但站点没有返回任何模型", detail: (res.warnings || []).join("；") });
+      setFormStatus(form, { ok: false, title: t("Connected, but the relay returned no models"), detail: (res.warnings || []).join("; ") });
     } else if (res.ok) {
       const software = res.software?.name ? ` · ${res.software.name} ${res.software.version || ""}` : "";
-      const warnings = res.warnings?.length ? `\n${res.warnings.join("；")}` : "";
+      const warnings = res.warnings?.length ? `\n${res.warnings.join("; ")}` : "";
       setFormStatus(form, {
         ok: true,
-        title: `连通，共 ${res.models.length} 个模型`,
-        detail: `文本 ${res.counts.text} · 图片 ${res.counts.image} · 视频 ${res.counts.video}${software} · ${res.latency_ms} ms${warnings}`,
+        title: t("Connected, {count} models", { count: res.models.length }),
+        detail: `${t("Text {text} · Image {image} · Video {video}", res.counts)}${software} · ${res.latency_ms} ms${warnings}`,
       });
     } else {
-      setFormStatus(form, { ok: false, title: "连接失败", detail: res.error });
+      setFormStatus(form, { ok: false, title: t("Connection failed"), detail: res.error });
     }
   } catch (e) {
-    setFormStatus(form, { ok: false, title: "请检查", detail: e.message }); // 没发出请求，是填写的内容有问题
+    setFormStatus(form, { ok: false, title: t("Please check"), detail: e.message }); // 没发出请求，是填写的内容有问题
   } finally {
     setBusy(form, false);
   }
@@ -680,15 +753,15 @@ async function testForm(form) {
 
 async function saveForm(form) {
   const renaming = form.mode === "edit" && form.values.name.trim() !== form.original;
-  if (renaming && !(await askConfirm(`改名后，已经用到「${form.original}」的工作流需要重新选择中转站。确定改名吗？`, "改名"))) return;
-  setBusy(form, true, "正在保存…");
+  if (renaming && !(await askConfirm(t("After renaming, workflows that use \"{name}\" will need another relay. Rename it?", { name: form.original }), t("Rename")))) return;
+  setBusy(form, true, t("Saving…"));
   const body = { ...form.values };
   try {
     const res = form.mode === "add"
       ? await api("relays", { method: "POST", body })
       : await api(`relays/${encodeURIComponent(form.original)}`, { method: "PUT", body });
     const name = res.relay.name;
-    toast(form.mode === "add" ? `已添加「${name}」` : `已保存「${name}」`, "ok");
+    toast(form.mode === "add" ? t("Added \"{name}\"", { name }) : t("Saved \"{name}\"", { name }), "ok");
     if (form.original) invalidate(form.original);
     invalidate(name);
     state.selected = name;
@@ -699,7 +772,7 @@ async function saveForm(form) {
     probe(name, true);
   } catch (e) {
     setBusy(form, false);
-    setFormStatus(form, { ok: false, title: "保存失败", detail: e.message });
+    setFormStatus(form, { ok: false, title: t("Save failed"), detail: e.message });
   }
 }
 
@@ -728,7 +801,7 @@ if (EMBEDDED) {
       for (const key of ["name", "base_url", "proxy"]) form.refs[key].value = form.values[key];
       form.refs.key.value = form.values.api_key;
       form.refs.paste.value = draft.paste;
-      setFormStatus(form, { ok: true, title: "已恢复刚才没保存的内容", detail: "面板刚才被关掉过，检查一下再保存" });
+      setFormStatus(form, { ok: true, title: t("Restored your unsaved input"), detail: t("The panel was closed for a moment. Please check it before saving") });
     },
   };
 }
@@ -738,7 +811,7 @@ window.addEventListener("message", (event) => {
   const msg = event.data;
   if (!msg || msg.source !== "relay-api-comfy") return;
   if (msg.type === "add-node-result") {
-    toast(msg.ok ? `已添加到画布：${msg.title}` : `添加失败：${msg.error}`, msg.ok ? "ok" : "err");
+    toast(msg.ok ? t("Added to canvas: {title}", { title: msg.title }) : t("Could not add it: {error}", { error: msg.error }), msg.ok ? "ok" : "err");
   } else if (msg.type === "reload") {
     loadState();
   }
@@ -777,5 +850,25 @@ if (TOKEN) {
   }, 10000);
 }
 
-document.getElementById("btnAdd").addEventListener("click", () => openForm("add"));
+document.title = t("Relay Manager");
+document.getElementById("title").textContent = t("Relay Manager");
+document.getElementById("cfgPath").textContent = t("Loading…");
+const addButton = document.getElementById("btnAdd");
+addButton.textContent = t("＋ Add relay");
+addButton.addEventListener("click", () => openForm("add"));
+if (!EMBEDDED) {
+  // 独立窗口没有 ComfyUI 的语言设置可跟随，默认英文，用这个开关切换并记住
+  const langButton = document.getElementById("btnLang");
+  langButton.hidden = false;
+  langButton.textContent = LANG === "zh" ? "English" : "中文";
+  langButton.addEventListener("click", () => {
+    try {
+      localStorage.setItem(LANG_KEY, LANG === "zh" ? "en" : "zh");
+    } catch {
+      /* 存不了就只是下次还是默认语言 */
+    }
+    location.reload();
+  });
+  await api("language", { method: "POST", body: { lang: LANG } }).catch(() => {}); // 后端的报错文字也用同一种语言
+}
 started = loadState();

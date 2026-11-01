@@ -10,8 +10,10 @@ from urllib.parse import urlparse
 
 try:
     from . import relay_client as rc
+    from .relay_i18n import tr
 except ImportError:  # 独立运行管理器时
     import relay_client as rc
+    from relay_i18n import tr
 
 CACHE_TTL = 600  # 秒
 KIND_ORDER = {"image": 0, "video": 1, "text": 2, "other": 3}
@@ -70,9 +72,9 @@ def classify(model_id: str, endpoint_types: list[str] | None = None, owned_by: s
         return {"kind": "other", "api_format": None, "reason": ""}
     # 任务插件的模型不是对话模型：当成文本的话，「测一下」发一句话就可能生成一个要扣费的视频
     if owned_by.strip().lower() == TASK_OWNER and kind in (None, "video") and "image-generation" not in types:
-        return {"kind": "video", "api_format": "task", "reason": "站点标注为任务插件模型，站点会按模型找到插件"}
+        return {"kind": "video", "api_format": "task", "reason": tr("Marked by the relay as a task-plugin model; the relay finds the plugin from the model")}
     if "openai-video" in types:
-        return {"kind": "video", "api_format": "openai", "reason": "站点标注为 OpenAI 视频接口（/v1/videos）"}
+        return {"kind": "video", "api_format": "openai", "reason": tr("Marked by the relay as using the OpenAI video API (/v1/videos)")}
     if "image-generation" in types:
         return {"kind": "image", **_image_format(m, types)}
     if kind == "other":
@@ -86,22 +88,22 @@ def classify(model_id: str, endpoint_types: list[str] | None = None, owned_by: s
 
 def _image_format(m: str, types: list[str]) -> dict[str, str]:
     if _has(m, CHAT_IMAGE_WORDS):
-        return {"api_format": "chat", "reason": "这类生图模型在中转站上通常走对话接口"}
+        return {"api_format": "chat", "reason": tr("On relays, this kind of image model usually goes through the chat API")}
     if "banana" in m or ("gemini" in m and "image" in m):
         if "gemini" in types:
-            return {"api_format": "gemini", "reason": "站点标注支持 Gemini 原生接口，可以设宽高比和 4K"}
+            return {"api_format": "gemini", "reason": tr("Marked by the relay as supporting the native Gemini API, with aspect ratio and 4K options")}
         if types and types[0] == "image-generation":
-            return {"api_format": "images", "reason": "站点标注走图像生成接口（/v1/images）"}
-        return {"api_format": "chat", "reason": "多数中转站通过对话接口提供 nano-banana，不行再试 gemini 格式"}
+            return {"api_format": "images", "reason": tr("Marked by the relay as using the image generation API (/v1/images)")}
+        return {"api_format": "chat", "reason": tr("Most relays offer nano-banana through the chat API; if that fails, try the gemini format")}
     if _has(m, ("seedream", "seededit", "jimeng", "doubao")):
-        return {"api_format": "images-json", "reason": "Seedream / 即梦类模型的参考图放在 image 字段里"}
-    return {"api_format": "images", "reason": "OpenAI 图像接口（/v1/images）"}
+        return {"api_format": "images-json", "reason": tr("Seedream and Jimeng models take reference images in the image field")}
+    return {"api_format": "images", "reason": tr("OpenAI image API (/v1/images)")}
 
 
 def _video_format(m: str) -> dict[str, str]:
     if "sora" in m:
-        return {"api_format": "openai", "reason": "Sora 用 OpenAI 视频接口（/v1/videos），不行再试对话接口"}
-    return {"api_format": "unified", "reason": "统一视频接口（/v1/video/generations），不行再试对话接口"}
+        return {"api_format": "openai", "reason": tr("Sora uses the OpenAI video API (/v1/videos); if that fails, try the chat API")}
+    return {"api_format": "unified", "reason": tr("Unified video API (/v1/video/generations); if that fails, try the chat API")}
 
 
 # ---------- 探测 ----------
@@ -114,6 +116,11 @@ def _fingerprint(relay: rc.Relay) -> str:
 def _origin(relay: rc.Relay) -> str:
     parsed = urlparse(relay.root)
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def clear() -> None:
+    """换语言后丢掉全部缓存：推荐理由和提示是按当时的语言生成的。"""
+    _cache.clear()
 
 
 def forget(name: str) -> None:
@@ -151,7 +158,7 @@ async def _fetch_status(session, relay: rc.Relay) -> dict | None:
     version = str(info.get("version") or "").strip()[:40]
     if not (kind or site or version):
         return None
-    return {"name": kind or site or "未知", "site_name": site, "version": version}
+    return {"name": kind or site or tr("Unknown"), "site_name": site, "version": version}
 
 
 async def _fetch_pricing(session, relay: rc.Relay) -> dict[str, list[str]]:
@@ -166,8 +173,10 @@ async def _fetch_pricing(session, relay: rc.Relay) -> dict[str, list[str]]:
     return result
 
 
-QUERY_BLOCKED_MSG = ("这个令牌限定了可用模型，站点不允许它查询 /v1/video/generations 和 /v1/videos 上的任务："
-                     "能提交、会扣费，却查不到结果。先到站点后台取消令牌的模型限制再生成视频")
+QUERY_BLOCKED_MSG = ("This token is limited to specific models, and the relay does not let it check tasks on "
+                     "/v1/video/generations or /v1/videos: it can submit and be charged, but never see the result. "
+                     "Remove the token's model limit in the relay's console before generating video")
+QUERY_BLOCKED_WORDS = ("无权访问模型", "no access to model")  # 站点自己的报错，语言看站点
 
 
 async def _query_blocked(relay: rc.Relay) -> bool:
@@ -178,7 +187,7 @@ async def _query_blocked(relay: rc.Relay) -> bool:
             await rc.request_json(session, relay, "GET", "/v1/video/generations/relay-check", timeout=8,
                                   max_bytes=1 << 20)
     except rc.RelayError as e:
-        return "无权访问模型" in str(e)
+        return any(word in str(e).lower() for word in QUERY_BLOCKED_WORDS)
     except asyncio.TimeoutError:
         pass
     return False
@@ -201,7 +210,7 @@ async def _probe(relay: rc.Relay, timeout: float) -> dict:
 
     items = data.get("data") if isinstance(data, dict) else data
     if not isinstance(items, list):
-        return {"ok": False, "error": f"看不懂模型列表的格式：{rc.short(data)}"}
+        return {"ok": False, "error": tr("Cannot understand the model list format: {detail}", detail=rc.short(data))}
 
     pricing = pricing or {}
     models, seen = [], set()
@@ -220,11 +229,11 @@ async def _probe(relay: rc.Relay, timeout: float) -> dict:
 
     warnings = []
     if not models:
-        warnings.append("站点返回的模型列表是空的，可能是令牌没有分组权限")
+        warnings.append(tr("The relay returned an empty model list. The token may lack group permissions"))
     if not any(m["endpoint_types"] for m in models):
-        warnings.append("站点没有标注每个模型支持的接口，图片/视频的推荐格式是按模型名猜的")
+        warnings.append(tr("The relay does not mark which APIs each model supports, so recommended image and video formats are guessed from model names"))
     if any(m["api_format"] in ("unified", "openai") for m in models if m["kind"] == "video") and await _query_blocked(relay):
-        warnings.append(QUERY_BLOCKED_MSG)
+        warnings.append(tr(QUERY_BLOCKED_MSG))
     return {
         "ok": True,
         "error": "",

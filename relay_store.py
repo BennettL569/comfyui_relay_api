@@ -18,10 +18,13 @@ from urllib.parse import urlparse, urlunparse
 
 try:
     from . import relay_client as rc
+    from .relay_i18n import tr
 except ImportError:  # 独立运行管理器时
     import relay_client as rc
+    from relay_i18n import tr
 
 NAME_MAX = 40
+PANEL_EDIT_KEY = "_panel_edit"  # 以下划线开头：不算中转站，名字也不允许以下划线开头，所以接口没法借添加中转站改它
 _THREAD_LOCK = threading.Lock()
 
 KEY_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_\-]{8,}")
@@ -40,7 +43,7 @@ NON_API_SEGMENTS = {"console", "panel", "token", "tokens", "login", "register", 
 LOCAL_HOST_RE = re.compile(r"^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)", re.I)
 URL_LABEL_RE = re.compile(r"(接口|地址|base|endpoint|api|域名|url)\s*[:：=]?\s*$", re.I)
 PROXY_LABEL_RE = re.compile(r"(代理|proxy)\S{0,4}\s*[:：=]?\s*$", re.I)
-KEY_REQUIRED_MSG = "换了站点地址或代理，就要重新填写令牌（防止令牌被发到别的地方）"
+KEY_REQUIRED_MSG = "If you change the relay address or proxy you must enter the token again (so it is never sent somewhere else)"
 
 
 # ---------- 读写 ----------
@@ -59,7 +62,7 @@ def _locked() -> Iterator[None]:
                     break
                 except OSError:
                     if time.monotonic() > deadline:
-                        raise rc.RelayError("配置文件正被另一个程序修改，请稍后再试") from None
+                        raise rc.RelayError(tr("The config file is being changed by another program. Try again shortly")) from None
                     time.sleep(0.05)
             try:
                 yield
@@ -106,7 +109,7 @@ def write_raw(data: dict[str, Any]) -> None:
             os.fsync(f.fileno())
         if os.path.isfile(path):
             with contextlib.suppress(OSError):
-                shutil.copyfile(path, path + ".bak")
+                shutil.copy(path, path + ".bak")  # 连权限一起复制：备份里也有令牌
         # ComfyUI 正好在读文件时，Windows 上替换会短暂失败，重试几次
         for attempt in range(20):
             try:
@@ -114,7 +117,7 @@ def write_raw(data: dict[str, Any]) -> None:
                 break
             except PermissionError:
                 if attempt == 19:
-                    raise rc.RelayError("保存失败：relays.json 正被其他程序占用，请稍后再试") from None
+                    raise rc.RelayError(tr("Save failed: relays.json is in use by another program. Try again shortly")) from None
                 time.sleep(0.05)
     except BaseException:
         if os.path.exists(tmp):
@@ -145,14 +148,14 @@ def mask_key(key: str) -> str:
 
 
 def mask_url_auth(url: str) -> str:
-    """地址里的密码不显示：http://alice:secret@host:3128 → http://alice:•••@host:3128。"""
+    """地址里的账号密码不显示：http://alice:secret@host:3128 → http://•••@host:3128。有的代理把令牌写在用户名里，所以用户名也遮。"""
     parsed = urlparse(url or "")
-    if not parsed.password:
+    if not parsed.username and not parsed.password:
         return url or ""
     host = parsed.hostname or ""
     if ":" in host:
         host = f"[{host}]"
-    netloc = f"{parsed.username}:•••@{host}" + (f":{parsed.port}" if parsed.port else "")
+    netloc = f"•••@{host}" + (f":{parsed.port}" if parsed.port else "")
     return urlunparse(parsed._replace(netloc=netloc))
 
 
@@ -207,12 +210,12 @@ def normalize_base_url(url: str) -> str:
 def check_base_url(value: str, api_key: str = "") -> str:
     value = normalize_base_url(value)
     if not value:
-        raise rc.RelayError("请填写接口地址")
+        raise rc.RelayError(tr("Please enter the API address"))
     if any(ord(c) > 127 for c in value) or KEY_RE.search(value) or (api_key and api_key in value):
-        raise rc.RelayError("接口地址里混进了中文或令牌，请检查一下（只填 https://… 这一段）")
+        raise rc.RelayError(tr("The API address contains non-ASCII text or a token. Please check it (enter only the https://… part)"))
     parsed = urlparse(value)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise rc.RelayError(f"接口地址格式不对：{value}")
+        raise rc.RelayError(tr("Invalid API address: {value}", value=value))
     return value
 
 
@@ -228,24 +231,24 @@ def check_proxy(value: str) -> str:
     except ValueError:
         parsed = None
     if parsed is None or parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise rc.RelayError("代理只支持 HTTP 代理，填 Clash / v2rayN 的 HTTP 或混合端口，例如 http://127.0.0.1:7890")
+        raise rc.RelayError(tr("Only HTTP proxies are supported. Use the HTTP or mixed port of Clash or v2rayN, for example http://127.0.0.1:7890"))
     return value.rstrip("/")
 
 
 def _check_name(name: str, data: dict, old_name: str | None = None) -> str:
     name = (name or "").strip()
     if not name:
-        raise rc.RelayError("请填写名称")
+        raise rc.RelayError(tr("Please enter a name"))
     if len(name) > NAME_MAX:
-        raise rc.RelayError(f"名称太长了（最多 {NAME_MAX} 个字）")
+        raise rc.RelayError(tr("Name too long (at most {count} characters)", count=NAME_MAX))
     if name.startswith("_"):
-        raise rc.RelayError("名称不能以下划线开头")
+        raise rc.RelayError(tr("Names cannot start with an underscore"))
     if any(c in name for c in "/\\"):
-        raise rc.RelayError("名称里不能有斜杠")
+        raise rc.RelayError(tr("Names cannot contain slashes"))
     if name != old_name and name in data:  # 和配置里任何字段（包括手写的备注）都不能重名
         if isinstance(data[name], dict):
-            raise rc.RelayError(f"已经有叫「{name}」的中转站了")
-        raise rc.RelayError(f"「{name}」和配置文件里的其他字段重名了，换个名字吧")
+            raise rc.RelayError(tr('A relay named "{name}" already exists', name=name))
+        raise rc.RelayError(tr('"{name}" clashes with another field in the config file. Please choose a different name', name=name))
     return name
 
 
@@ -284,7 +287,7 @@ def add_relay(name: str, base_url: str, api_key: str, proxy: str = "") -> dict:
         api_key = (api_key or "").strip()
         base_url = check_base_url(base_url, api_key)
         if not api_key:
-            raise rc.RelayError("请填写令牌（API Key）")
+            raise rc.RelayError(tr("Please enter the token (API key)"))
         data[name] = {"base_url": base_url, "api_key": api_key, "proxy": check_proxy(proxy)}
         write_raw(data)
         return public_view(name, data[name])
@@ -296,7 +299,7 @@ def update_relay(old_name: str, name: str, base_url: str, api_key: str = "", pro
         data = read_raw()
         relays = _relays(data)
         if old_name not in relays:
-            raise rc.RelayError(f"没有名为「{old_name}」的中转站")
+            raise rc.RelayError(tr('No relay named "{name}"', name=old_name))
         old = relays[old_name]
         name = _check_name(name, data, old_name)
         api_key = (api_key or "").strip()
@@ -307,9 +310,9 @@ def update_relay(old_name: str, name: str, base_url: str, api_key: str = "", pro
             entry["api_key"] = api_key
             entry.pop("api_key_env", None)
         elif not _has_key(old):
-            raise rc.RelayError("请填写令牌（API Key）")
+            raise rc.RelayError(tr("Please enter the token (API key)"))
         elif not can_reuse_key(old, base_url, proxy):
-            raise rc.RelayError(KEY_REQUIRED_MSG)
+            raise rc.RelayError(tr(KEY_REQUIRED_MSG))
         entry["base_url"] = base_url
         entry["proxy"] = proxy
         # 改名时保持原来的位置
@@ -322,8 +325,18 @@ def delete_relay(name: str) -> None:
     with _locked():
         data = read_raw()
         if name not in _relays(data):
-            raise rc.RelayError(f"没有名为「{name}」的中转站")
+            raise rc.RelayError(tr('No relay named "{name}"', name=name))
         del data[name]
+        write_raw(data)
+
+
+def set_panel_edit(enabled: bool) -> None:
+    """ComfyUI 侧边栏能不能改中转站的开关，存在 relays.json 里。只有独立管理器能调用这个，见 manager_api.can_edit。"""
+    with _locked():
+        data = read_raw()
+        data.pop(PANEL_EDIT_KEY, None)
+        if enabled:
+            data[PANEL_EDIT_KEY] = True
         write_raw(data)
 
 
@@ -372,7 +385,7 @@ def suggest_name(base_url: str, existing: dict | list | None = None) -> str:
             labels = labels[:-1]
         labels = [p for p in labels if p not in ("api", "www", "openai", "gateway", "relay")]
         base = labels[-1] if labels else host
-    base = base[:NAME_MAX] or "中转站"
+    base = base[:NAME_MAX] or "relay"
     taken = set(existing or [])
     name, i = base, 2
     while name in taken:

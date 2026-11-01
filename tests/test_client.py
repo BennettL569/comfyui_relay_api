@@ -15,6 +15,8 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(HERE))
+os.environ["COMFY_RELAY_LANG"] = "zh"  # 断言用的是中文原话，顺带核对翻译
+os.environ["COMFY_RELAY_ALLOW_PRIVATE_DOWNLOADS"] = "1"  # 模拟的第三方存储在本机。关掉时的行为在 t_download_safety 里单独测
 
 import relay_client as rc  # noqa: E402
 from mock_relay import KEY, KEY_LIMITED, MP4, PNG, MockRelay  # noqa: E402
@@ -279,6 +281,125 @@ async def t_video_task(mock):
     assert not any(name == "chat" for name, _ in mock.requests[before:])
 
 
+async def t_download_safety(mock):
+    r = relay()
+    cdn = f"{mock.cdn}/files/test.png"
+    own = f"http://127.0.0.1:{RELAY_PORT}"
+    async with rc.new_session() as s:
+        # 回复里的地址不可信：不是中转站自己的，就不能指向本机和内网
+        del os.environ[rc.ALLOW_PRIVATE_ENV]
+        try:
+            for url in (cdn, "http://127.0.0.1:9/x.png", "http://[::1]:9/x.png", "http://169.254.169.254/latest/meta-data",
+                        "http://10.0.0.1/x.png", "http://192.168.1.1/x.png", "http://localhost:9/x.png"):
+                await expect_error_async(rc.download(s, r, url), "拒绝从")
+            # 中转站自己的地址不受影响，哪怕它就在本机
+            assert await rc.download(s, r, f"{own}/owned/test.png") == PNG
+            # 中转站把下载重定向到内网：也要拒绝，每一跳都要查
+            await expect_error_async(rc.download(s, r, f"{own}/redirect?to={cdn}"), "拒绝从")
+        finally:
+            os.environ[rc.ALLOW_PRIVATE_ENV] = "1"
+
+        # 重定向到第三方存储（常见的做法）：跟过去，但不带令牌
+        mock.cdn_auth.clear()
+        mock.cdn_goog.clear()
+        assert await rc.download(s, r, f"{own}/redirect?to={cdn}") == PNG
+        assert mock.cdn_auth == [None] and mock.cdn_goog == [None], (mock.cdn_auth, mock.cdn_goog)
+
+        # 第三方地址的错误内容不能出现在报错里：等于让人读到那个地址返回了什么
+        try:
+            await rc.download(s, r, f"{mock.cdn}/files/secret.json")
+        except rc.RelayError as e:
+            assert "404" in str(e) and "internal-secret" not in str(e), e
+        else:
+            raise AssertionError("应该报错")
+
+        # 带令牌的接口请求不跟随去别的站点的重定向，令牌留在这个站
+        mock.cdn_auth.clear()
+        mock.cdn_goog.clear()
+        await expect_error_async(rc.request_json(s, r, "GET", f"/redirect?to={mock.cdn}/files/test.png"), "重定向")
+        await expect_error_async(rc.request_json(s, r, "POST", f"/redirect?to={mock.cdn}/files/test.png", json_body={}), "重定向")
+        assert mock.cdn_auth == [] and mock.cdn_goog == [], "令牌被带到了别的站点"
+        # 同一个站点内的 GET 可以跟
+        assert (await rc.request_json(s, r, "GET", f"/redirect?to={own}/v1/models"))["success"] is True
+
+    # 工作流里的模型名不能改变 Gemini 的请求路径，也不能把 x-goog-api-key 带走
+    mock.cdn_goog.clear()
+    evil = f"../../redirect?to={mock.cdn}/files/test.png#"
+    try:
+        await rc.gemini_image(r, evil, "p", [], aspect_ratio="auto", image_size="auto", extra={}, timeout=10, check_interrupt=None)
+    except rc.RelayError:
+        pass
+    assert mock.cdn_goog == [], "令牌被带到了别的站点"
+
+    # 地址判断：各种写法的内网都算内网，Clash 这类工具的假 IP 不算
+    for address in ("127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.169.254", "0.0.0.0", "::1", "::ffff:127.0.0.1",
+                    "64:ff9b::a00:1", "::7f00:1", "fec0::1", "fd00::1", "ff02::1", "224.0.0.1", "2002:7f00:1::1", "bad"):
+        assert not rc._is_public_ip(address), address
+    for address in ("8.8.8.8", "2001:4860:4860::8888", "198.18.0.5", "198.19.255.1", "fc00::5", "64:ff9b::808:808"):
+        assert rc._is_public_ip(address), address
+    # 回复里的地址写法不对：报错，不能让异常把任务 ID 弄丢
+    async with rc.new_session() as s:
+        for url in ("http://[bad/x.png", "http://a..b/x.png", "http://example.com:99999/x.png"):
+            await expect_error_async(rc.download(s, r, url), "下载失败")
+
+    # 只设了 NO_PROXY：不算走代理，连接时的检查还要有
+    saved = os.environ.get("NO_PROXY")
+    os.environ["NO_PROXY"] = "example.com"
+    try:
+        session = rc._external_session(r)
+        try:
+            assert isinstance(session.connector._resolver, rc._PublicResolver) or "HTTP_PROXY" in os.environ or "HTTPS_PROXY" in os.environ
+        finally:
+            await session.close()
+    finally:
+        if saved is None:
+            del os.environ["NO_PROXY"]
+        else:
+            os.environ["NO_PROXY"] = saved
+
+    # 一条回复里的图片地址有上限
+    many = {"content": " ".join(f"https://a.example.com/{i}.png" for i in range(100))}
+    assert len(rc.find_image_refs(many)) == rc.MAX_IMAGE_REFS
+
+
+async def t_secrets_in_errors(mock):
+    # 代理账号密码单独传，连接失败的报错里不能出现
+    proxied = rc.Relay("p", "https://relay.invalid/v1", KEY, "http://alice:s3cretpw@127.0.0.1:9")
+    assert proxied.proxy_args["proxy"] == "http://127.0.0.1:9" and proxied.proxy_args["proxy_auth"].password == "s3cretpw"
+    async with rc.new_session() as s:
+        try:
+            await rc.request_json(s, proxied, "GET", "/v1/models", timeout=10)
+        except rc.RelayError as e:
+            assert "s3cretpw" not in str(e) and "alice" not in str(e) and KEY not in str(e), e
+        else:
+            raise AssertionError("应该报错")
+    assert rc.Relay("p", "https://r.example.com", "k").proxy_args == {"proxy": None, "proxy_auth": None}
+    # 代理回 407 时 aiohttp 的报错会带上代理地址
+    async def answer(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(answer, "127.0.0.1", 18913)
+    try:
+        strict = rc.Relay("p", "https://relay.invalid/v1", KEY, "http://alice:s3cretpw@127.0.0.1:18913")
+        async with rc.new_session() as s:
+            try:
+                await rc.request_json(s, strict, "GET", "/v1/models", timeout=10)
+            except rc.RelayError as e:
+                assert "s3cretpw" not in str(e) and "alice" not in str(e), e
+            else:
+                raise AssertionError("应该报错")
+    finally:
+        server.close()
+        await server.wait_closed()
+    # 报错文字里的令牌也会被去掉
+    assert KEY not in relay().scrub(f"bad {KEY}")
+    # 太短的代理用户名不替换，不然报错里的字母都变成 ***
+    assert rc.Relay("p", "https://r.example.com", "k" * 20, "http://a:longpassword@127.0.0.1:9").scrub("bad address longpassword") == "bad address ***"
+
+
 async def t_poll_failures(mock):
     # 限定了模型的令牌：能提交，查询一直 403。重试几次后报错，并带上任务 ID 方便到后台找
     limited = rc.Relay("limited", f"http://127.0.0.1:{RELAY_PORT}/v1", KEY_LIMITED)
@@ -315,7 +436,7 @@ async def t_interrupt(mock):
 
 
 TESTS = [t_config, t_extra, t_parsers, t_models, t_chat, t_images, t_chat_image, t_gemini,
-         t_video_unified, t_video_openai, t_video_chat, t_video_custom, t_video_task, t_poll_failures, t_interrupt]
+         t_video_unified, t_video_openai, t_video_chat, t_video_custom, t_video_task, t_download_safety, t_secrets_in_errors, t_poll_failures, t_interrupt]
 
 
 async def main() -> int:

@@ -1,13 +1,13 @@
 {
-  "_说明": "每个中转站一项，名字随便起，会显示在节点的「中转站」下拉框里。base_url 填站点给的接口地址，带不带 /v1 都行；api_key 填令牌；需要代理才能访问的站在 proxy 里填代理地址（如 http://127.0.0.1:7890），不需要就留空。改完在 ComfyUI 界面按 R 刷新节点即可，不用重启。",
-  "站点1": {
-    "base_url": "https://你的中转站地址/v1",
-    "api_key": "在这里填你的key",
+  "_note": "One entry per relay. The name is up to you and shows in the node's relay list. base_url is the API address from the relay, with or without /v1. api_key is your token. Only fill in proxy if you need one to reach the relay, for example http://127.0.0.1:7890. After editing, press R in ComfyUI to refresh the nodes.",
+  "relay-1": {
+    "base_url": "https://your-relay.example.com/v1",
+    "api_key": "your-api-key",
     "proxy": ""
   },
-  "站点2": {
-    "base_url": "https://你的另一个中转站地址/v1",
-    "api_key": "在这里填你的key",
+  "relay-2": {
+    "base_url": "https://your-other-relay.example.com/v1",
+    "api_key": "your-api-key",
     "proxy": ""
   }
 }

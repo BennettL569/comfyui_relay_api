@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>中转站管理器</title>
+  <title>Relay Manager</title>
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
 </head>
@@ -12,11 +12,14 @@
     <div class="brand">
       <div class="logo">⇄</div>
       <div style="min-width:0">
-        <h1>中转站管理器</h1>
-        <p id="cfgPath" class="muted">加载中…</p>
+        <h1 id="title">Relay Manager</h1>
+        <p id="cfgPath" class="muted">Loading…</p>
       </div>
     </div>
-    <button id="btnAdd" class="btn primary">＋ 添加中转站</button>
+    <div class="actions">
+      <button id="btnLang" class="btn" hidden></button>
+      <button id="btnAdd" class="btn primary">＋ Add relay</button>
+    </div>
   </header>
   <div id="banner"></div>
   <main class="layout">

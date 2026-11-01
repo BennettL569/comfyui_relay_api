@@ -7,21 +7,33 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import functools
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import time
+import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 
 import aiohttp
+
+try:
+    from .relay_i18n import tr
+except ImportError:  # 独立运行管理器时
+    from relay_i18n import tr
 
 log = logging.getLogger("comfyui_relay_api")
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_ENV = "COMFY_RELAY_CONFIG"
+ALLOW_PRIVATE_ENV = "COMFY_RELAY_ALLOW_PRIVATE_DOWNLOADS"  # 接口回复里的文件确实放在内网时，在这台电脑上设成 1
+# relays.example.json 里的占位文字（旧版本的示例是中文，手上的配置可能还留着）
+PLACEHOLDER_WORDS = ("你的", "填", "your-relay", "your-api-key")
 
 SUCCESS_STATUSES = {"completed", "complete", "succeeded", "succeed", "success", "successful", "done", "finished"}
 FAILURE_STATUSES = {"failed", "fail", "failure", "error", "cancelled", "canceled", "expired", "rejected", "timeout"}
@@ -61,7 +73,7 @@ def _read_config_text(path: str) -> str:
             break
         except PermissionError:
             if attempt == 19:
-                raise RelayError(f"{path} 正被其他程序占用，请稍后再试") from None
+                raise RelayError(tr("{path} is in use by another program. Try again shortly.", path=os.path.basename(path))) from None
             time.sleep(0.05)
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16")
@@ -70,7 +82,7 @@ def _read_config_text(path: str) -> str:
             return raw.decode(encoding)
         except UnicodeDecodeError:
             continue
-    raise RelayError(f"{path} 的编码认不出来，请用记事本「另存为」并把编码选成 UTF-8")
+    raise RelayError(tr("Cannot detect the encoding of {path}. Save it as UTF-8 and try again.", path=os.path.basename(path)))
 
 
 def read_config() -> dict[str, Any]:
@@ -81,9 +93,9 @@ def read_config() -> dict[str, Any]:
     try:
         data = json.loads(_read_config_text(path))
     except json.JSONDecodeError as e:
-        raise RelayError(f"{path} 不是合法的 JSON：{e}（上一次保存的版本在 relays.json.bak）") from None
+        raise RelayError(tr("{path} is not valid JSON: {error} (the last saved version is in relays.json.bak)", path=os.path.basename(path), error=e)) from None
     if not isinstance(data, dict):
-        raise RelayError(f"{path} 最外层必须是 JSON 对象")
+        raise RelayError(tr("The top level of {path} must be a JSON object", path=os.path.basename(path)))
     return data
 
 
@@ -92,7 +104,25 @@ def load_relays() -> dict[str, dict]:
 
 
 def _unfilled(value: str) -> bool:
-    return not value or "你的" in value or "填" in value
+    return not value or any(word in value for word in PLACEHOLDER_WORDS)
+
+
+def _split_proxy(proxy: str | None) -> tuple[str | None, aiohttp.BasicAuth | None]:
+    """把代理地址里的账号密码拆出来单独传：写在地址里的话，代理报错时 aiohttp 的错误信息会把密码带出来。"""
+    if not proxy:
+        return None, None
+    parsed = urlparse(proxy)
+    try:
+        port = parsed.port
+    except ValueError:
+        return proxy, None
+    if not parsed.username and not parsed.password:
+        return proxy, None
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    clean = urlunparse(parsed._replace(netloc=host + (f":{port}" if port else "")))
+    return clean, aiohttp.BasicAuth(unquote(parsed.username or ""), unquote(parsed.password or ""))
 
 
 class Relay:
@@ -101,6 +131,8 @@ class Relay:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.proxy = proxy
+        proxy_url, proxy_auth = _split_proxy(proxy)
+        self.proxy_args = {"proxy": proxy_url, "proxy_auth": proxy_auth}
         # 去掉结尾的 /v1，各接口路径自己带版本号（/v1/...、/v1beta/...）
         self.root = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
 
@@ -109,7 +141,7 @@ class Relay:
         （例如别人分享的工作流在自定义路径里填了一个外部网址）。"""
         if path.startswith(("http://", "https://")):
             if not self.same_origin(path):
-                raise RelayError(f"只能请求中转站自己的地址，不能请求 {urlparse(path).netloc}（防止令牌被发到别的网站）")
+                raise RelayError(tr("Can only request the relay's own address, not {host} (so your token is never sent to another site)", host=urlparse(path).netloc))
             return path
         return f"{self.root}/{path.lstrip('/')}"
 
@@ -126,19 +158,28 @@ class Relay:
         a, b = urlparse(url), urlparse(self.root)
         return (a.scheme, a.netloc) == (b.scheme, b.netloc)
 
+    def scrub(self, text: str) -> str:
+        """报错文字里不能出现令牌和地址里的密码：报错会显示在界面上，也可能被转发给别人看。"""
+        secrets = [self.api_key, urlparse(self.proxy or "").username, urlparse(self.proxy or "").password,
+                   urlparse(self.root).password]
+        for secret in secrets:
+            if secret and len(secret) >= 4:  # 太短的（比如代理用户名 a）一替换反而把报错弄乱
+                text = text.replace(secret, "***")
+        return text
+
 
 def get_relay(name: str) -> Relay:
     cfg = load_relays().get(name)
     if cfg is None:
-        raise RelayError(f"relays.json 里没有名为「{name}」的中转站（{config_path()}）")
+        raise RelayError(tr('No relay named "{name}" in relays.json', name=name))
     base_url = str(cfg.get("base_url") or "").strip()
     api_key = str(cfg.get("api_key") or "").strip()
     if not api_key and cfg.get("api_key_env"):
         api_key = os.environ.get(str(cfg["api_key_env"]), "").strip()
     if _unfilled(base_url) or not base_url.startswith(("http://", "https://")):
-        raise RelayError(f"中转站「{name}」的 base_url 还没填好，应类似 https://api.example.com/v1")
+        raise RelayError(tr('The base_url of relay "{name}" is not set. It should look like https://api.example.com/v1', name=name))
     if _unfilled(api_key):
-        raise RelayError(f"中转站「{name}」的 api_key 还没填（{config_path()}）")
+        raise RelayError(tr('The api_key of relay "{name}" is not set', name=name))
     return Relay(name, base_url, api_key, str(cfg.get("proxy") or "").strip() or None)
 
 
@@ -151,9 +192,9 @@ def parse_extra(text: str | None) -> dict:
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
-        raise RelayError(f"额外参数不是合法的 JSON：{e}") from None
+        raise RelayError(tr("Extra params are not valid JSON: {error}", error=e)) from None
     if not isinstance(data, dict):
-        raise RelayError('额外参数必须是 JSON 对象，例如 {"quality": "high"}')
+        raise RelayError(tr('Extra params must be a JSON object, for example {"quality": "high"}'))
     return data
 
 
@@ -184,7 +225,7 @@ def to_data_url(data: bytes, mime: str) -> str:
 def decode_data_url(url: str) -> bytes:
     header, _, payload = url.partition(",")
     if ";base64" not in header:
-        raise RelayError("不支持非 base64 的 data URL")
+        raise RelayError(tr("Data URLs that are not base64 are not supported"))
     return base64.b64decode(payload)
 
 
@@ -210,8 +251,8 @@ def chat_content(prompt: str, images: list[tuple[bytes, str]]) -> str | list[dic
 
 
 def strip_data_urls(text: str) -> str:
-    text = MD_DATA_IMAGE_RE.sub("[图片]", text)
-    return DATA_URL_RE.sub("[图片]", text).strip()
+    text = MD_DATA_IMAGE_RE.sub(tr("[image]"), text)
+    return DATA_URL_RE.sub(tr("[image]"), text).strip()
 
 
 def _urls(text: str) -> list[str]:
@@ -231,17 +272,31 @@ def new_session() -> aiohttp.ClientSession:
 
 MAX_RESPONSE = 300 * 1024 * 1024  # 生图接口直接返回 base64 图片，4K 图可能几十 MB
 MAX_DOWNLOAD = 2 * 1024 * 1024 * 1024
+MAX_IMAGE_REFS = 16  # 一条回复里最多下载这么多张图：回复内容不可信，每张都可能很大
+MAX_REDIRECTS = 5
+REDIRECT_CODES = (301, 302, 303, 307, 308)
+
+
+def _scrub_errors(fn):
+    """第二个参数是 relay 的函数用这个：抛出的错误里去掉令牌和密码。"""
+    @functools.wraps(fn)
+    async def wrapper(session, relay, *args, **kwargs):
+        try:
+            return await fn(session, relay, *args, **kwargs)
+        except RelayError as e:
+            raise RelayError(relay.scrub(str(e))) from None
+    return wrapper
 
 
 async def _read_limited(resp: aiohttp.ClientResponse, limit: int) -> bytes:
     """读响应体但设上限，防止恶意站点返回超大内容把内存撑爆。"""
     if resp.content_length is not None and resp.content_length > limit:
-        raise RelayError(f"返回内容太大（{resp.content_length / 1048576:.0f} MB），已放弃")
+        raise RelayError(tr("Response too large ({size} MB), giving up", size=f"{resp.content_length / 1048576:.0f}"))
     chunks, size = [], 0
     async for chunk in resp.content.iter_chunked(1 << 16):
         size += len(chunk)
         if size > limit:
-            raise RelayError(f"返回内容太大（超过 {limit / 1048576:.0f} MB），已放弃")
+            raise RelayError(tr("Response too large (over {size} MB), giving up", size=f"{limit / 1048576:.0f}"))
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -258,8 +313,9 @@ def describe_body(text: str, content_type: str = "") -> str:
     if content_type == "text/html" or text.lstrip()[:1] == "<":
         m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
         title = " ".join(m.group(1).split())[:80] if m else ""
-        return (f"站点返回的是网页而不是接口数据{f'（页面标题：{title}）' if title else ''}。"
-                "可能是接口地址填成了网站首页，或者被 Cloudflare 拦截了（可以试试配置代理）")
+        return tr("The relay returned a web page instead of API data{title}. The address may point to the site's "
+                  "home page, or Cloudflare may be blocking the request (try setting a proxy).",
+                  title=tr(" (page title: {title})", title=title) if title else "")
     try:
         data = json.loads(text)
     except ValueError:
@@ -268,12 +324,23 @@ def describe_body(text: str, content_type: str = "") -> str:
     error = data.get("error") if isinstance(data, dict) else None
     if isinstance(error, dict) and isinstance(error.get("message"), str) and error["message"]:
         code = error.get("code")
-        return short(f"{error['message']}（{code}）" if code and isinstance(code, str) else error["message"])
+        return short(f"{error['message']} ({code})" if code and isinstance(code, str) else error["message"])
     if isinstance(error, str) and error:
         return short(error)
     return short(data)
 
 
+def _follow_same_origin(relay: Relay, method: str, url: str, location: str, resend: bool = False) -> str:
+    """带令牌的请求不让 aiohttp 自动跟随重定向：它只会去掉 Authorization，别的头（比如 x-goog-api-key）照样带到新地址。
+    只跟随同一个站点内的重定向，要去别的站点就报错，令牌不离开这个站。POST 只有 resend（307、308，请求体能再发一次）才跟。"""
+    target = urljoin(url, location)
+    if not (method == "GET" or resend) or not relay.same_origin(target):
+        raise RelayError(tr("The relay redirected this request to {host}. Redirects are not followed so your token "
+                            "stays on this relay. Please check the API address", host=urlparse(target).netloc))
+    return target
+
+
+@_scrub_errors
 async def request_json(
     session: aiohttp.ClientSession,
     relay: Relay,
@@ -289,22 +356,29 @@ async def request_json(
 ) -> Any:
     url = relay.url(path)
     try:
-        async with session.request(
-            method, url, json=json_body, data=form, headers=relay.headers(headers) if auth else headers,
-            proxy=relay.proxy, timeout=_timeout(timeout),
-        ) as resp:
-            status, ctype = resp.status, resp.content_type
-            text = _decode(await _read_limited(resp, max_bytes), resp.charset)
+        for _ in range(MAX_REDIRECTS + 1):
+            async with session.request(
+                method, url, json=json_body, data=form, headers=relay.headers(headers) if auth else headers,
+                allow_redirects=False, timeout=_timeout(timeout), **relay.proxy_args,
+            ) as resp:
+                status, ctype = resp.status, resp.content_type
+                location = resp.headers.get("Location") if status in REDIRECT_CODES else None
+                if not location:
+                    text = _decode(await _read_limited(resp, max_bytes), resp.charset)
+                    break
+            url = _follow_same_origin(relay, method, url, location, resend=status in (307, 308) and form is None)
+        else:
+            raise RelayError(tr("Too many redirects: {url}", url=url))
     except TimeoutError:
-        raise RelayError(f"请求超时（{timeout:g} 秒）：{method} {url}") from None
+        raise RelayError(tr("Request timed out ({seconds} s): {method} {url}", seconds=f"{timeout:g}", method=method, url=url)) from None
     except aiohttp.ClientError as e:
-        raise RelayError(f"连不上中转站「{relay.name}」：{e}") from None
+        raise RelayError(tr('Cannot reach relay "{name}": {error}', name=relay.name, error=e)) from None
     if status >= 400:
-        raise RelayError(f"{method} {url} 返回 HTTP {status}：{describe_body(text, ctype)}")
+        raise RelayError(tr("{method} {url} returned HTTP {status}: {detail}", method=method, url=url, status=status, detail=describe_body(text, ctype)))
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        raise RelayError(f"{method} {url} 返回的不是 JSON：{describe_body(text, ctype)}") from None
+        raise RelayError(tr("{method} {url} did not return JSON: {detail}", method=method, url=url, detail=describe_body(text, ctype))) from None
 
 
 def raise_for_error_payload(data: Any, what: str) -> None:
@@ -313,7 +387,7 @@ def raise_for_error_payload(data: Any, what: str) -> None:
         return
     err = data["error"]
     message = (err.get("message") or err.get("msg")) if isinstance(err, dict) else err
-    raise RelayError(f"{what}失败：{short(message or err)}")
+    raise RelayError(tr("{what} failed: {detail}", what=what, detail=short(message or err)))
 
 
 async def guarded(coro: Awaitable, check_interrupt: CheckInterrupt) -> Any:
@@ -343,24 +417,114 @@ async def sleep_checked(seconds: float, check_interrupt: CheckInterrupt) -> None
         await asyncio.sleep(min(0.5, left))
 
 
+# Clash、sing-box 等的 TUN 假 IP 模式下，所有域名都解析到这些地址，真实地址由代理决定，不能当成内网
+FAKE_IP_NETWORKS = (ipaddress.ip_network("198.18.0.0/15"), ipaddress.ip_network("fc00::/18"))
+# 这些 IPv6 写法的低 32 位是一个 IPv4 地址：NAT64 网络里能连到内网，IPv4 兼容地址可能指向本机
+EMBEDS_IPV4 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("::/96"))
+
+
+def _is_public_ip(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address.split("%")[0])
+    except ValueError:
+        return False
+    if ip.version == 6:
+        if any(ip in network for network in EMBEDS_IPV4):
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        else:
+            ip = ip.ipv4_mapped or ip.sixtofour or (ip.teredo[1] if ip.teredo else None) or ip
+    if any(ip.version == network.version and ip in network for network in FAKE_IP_NETWORKS):
+        return True
+    return ip.is_global and not ip.is_multicast and not getattr(ip, "is_site_local", False)
+
+
+def _private_download_error(host: str) -> RelayError:
+    return RelayError(tr("Refusing to download from {host}: it points to a private address. To allow this, set "
+                         "{env}=1 on this computer", host=host, env=ALLOW_PRIVATE_ENV))
+
+
+async def _check_public(url: str) -> None:
+    """接口回复里的下载地址不可信：别人分享的工作流可以让模型回复一个内网地址，插件下载后内容就被读出来了。
+    不是中转站自己的地址时，不许指向本机和内网。"""
+    if os.environ.get(ALLOW_PRIVATE_ENV) == "1":
+        return
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if parsed.scheme not in ("http", "https") or not host:
+        raise RelayError(tr("Download failed: {url}: {error}", url=url, error=parsed.scheme or "?"))
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return  # 这里解析不了，可能要靠代理解析，真正连接时再说
+    if any(not _is_public_ip(info[4][0]) for info in infos):
+        raise _private_download_error(host)
+
+
+class _PublicResolver(aiohttp.abc.AbstractResolver):
+    """连接时再查一次：防止域名检查时解析到公网，真正连接时又换成内网地址（DNS 重绑定）。"""
+
+    def __init__(self) -> None:
+        self._inner = aiohttp.DefaultResolver()
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        results = await self._inner.resolve(host, port, family)
+        if os.environ.get(ALLOW_PRIVATE_ENV) != "1" and any(not _is_public_ip(r["host"]) for r in results):
+            raise _private_download_error(host)
+        return results
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+
+def _external_session(relay: Relay) -> aiohttp.ClientSession:
+    """下载不是中转站的地址时用。走代理时域名由代理解析，这里看不到真实地址，只能靠连接前的检查。"""
+    proxies = urllib.request.getproxies()  # 只设了 NO_PROXY 时这里也不是空的，所以只看 http 和 https
+    if relay.proxy or proxies.get("http") or proxies.get("https"):
+        return new_session()
+    return aiohttp.ClientSession(trust_env=True, connector=aiohttp.TCPConnector(resolver=_PublicResolver()))
+
+
+@_scrub_errors
 async def download(session: aiohttp.ClientSession, relay: Relay, url: str, *, timeout: float = 600.0) -> bytes:
     if url.startswith("data:"):
         return decode_data_url(url)
-    url = relay.resolve(url)
-    # 只有和中转站同源的地址才带 Key，避免把 Key 发给第三方存储
-    headers = relay.headers() if relay.same_origin(url) else None
+    external = None
     try:
-        async with session.get(url, headers=headers, proxy=relay.proxy, timeout=_timeout(timeout)) as resp:
-            status, ctype = resp.status, resp.content_type
-            body = await _read_limited(resp, MAX_DOWNLOAD)
+        url = relay.resolve(url)
+        for _ in range(MAX_REDIRECTS + 1):
+            own = relay.same_origin(url)  # 每一跳都重新判断：重定向可能指向任何地方
+            if not own:
+                await _check_public(url)
+                external = external or _external_session(relay)
+            # 只有和中转站同源的地址才带 Key，避免把 Key 发给第三方存储
+            async with (session if own else external).get(
+                url, headers=relay.headers() if own else None, allow_redirects=False,
+                timeout=_timeout(timeout), **relay.proxy_args,
+            ) as resp:
+                status, ctype = resp.status, resp.content_type
+                location = resp.headers.get("Location") if status in REDIRECT_CODES else None
+                if not location:
+                    body = await _read_limited(resp, MAX_DOWNLOAD)
+                    break
+            url = urljoin(url, location)
+        else:
+            raise RelayError(tr("Too many redirects: {url}", url=url))
     except TimeoutError:
-        raise RelayError(f"下载超时：{url}") from None
-    except aiohttp.ClientError as e:
-        raise RelayError(f"下载失败：{url}：{e}") from None
+        raise RelayError(tr("Download timed out: {url}", url=url)) from None
+    except (aiohttp.ClientError, OSError, ValueError) as e:  # 回复里的地址可能是任何东西，ValueError 是地址写法不对
+        raise RelayError(tr("Download failed: {url}: {error}", url=url, error=e)) from None
+    finally:
+        if external:
+            await external.close()
+    # 不是中转站的地址只报状态：把内容写进报错，等于让人能读到那个地址返回了什么
     if status >= 400:
-        raise RelayError(f"下载 {url} 返回 HTTP {status}：{describe_body(_decode(body[:200_000], None), ctype)}")
+        if not own:
+            raise RelayError(tr("Download of {url} returned HTTP {status}", url=url, status=status))
+        raise RelayError(tr("Download of {url} returned HTTP {status}: {detail}", url=url, status=status, detail=describe_body(_decode(body[:200_000], None), ctype)))
     if (ctype == "application/json" or ctype.startswith("text/")) and len(body) < 100_000:
-        raise RelayError(f"下载 {url} 拿到的不是文件：{describe_body(_decode(body, None), ctype)}")
+        if not own:
+            raise RelayError(tr("Download of {url} did not return a file", url=url))
+        raise RelayError(tr("Download of {url} did not return a file: {detail}", url=url, detail=describe_body(_decode(body, None), ctype)))
     return body
 
 
@@ -370,9 +534,9 @@ def _first_message(data: Any) -> dict:
     try:
         message = data["choices"][0]["message"] or {}
     except (KeyError, IndexError, TypeError):
-        raise RelayError(f"返回里没有 choices[0].message：{short(data)}") from None
+        raise RelayError(tr("No choices[0].message in the response: {detail}", detail=short(data))) from None
     if not isinstance(message, dict):
-        raise RelayError(f"返回的消息格式不对：{short(data)}")
+        raise RelayError(tr("Unexpected message format in the response: {detail}", detail=short(data)))
     return message
 
 
@@ -404,7 +568,7 @@ async def _iter_sse(resp: aiohttp.ClientResponse) -> AsyncIterator[dict]:
     async for chunk in resp.content.iter_any():
         total += len(chunk)
         if total > MAX_RESPONSE:
-            raise RelayError("返回内容太大，已放弃")
+            raise RelayError(tr("Response too large, giving up"))
         buffer += chunk
         *lines, buffer = buffer.split(b"\n")
         for line in lines:
@@ -418,26 +582,29 @@ async def _iter_sse(resp: aiohttp.ClientResponse) -> AsyncIterator[dict]:
         yield event
 
 
+@_scrub_errors
 async def _chat_stream(session: aiohttp.ClientSession, relay: Relay, body: dict, timeout: float) -> tuple[str, dict]:
     url = relay.url("/v1/chat/completions")
     content, reasoning, images = [], [], []
     try:
-        async with session.post(url, json=body, headers=relay.headers(), proxy=relay.proxy, timeout=_timeout(timeout)) as resp:
+        async with session.post(url, json=body, headers=relay.headers(), allow_redirects=False, timeout=_timeout(timeout), **relay.proxy_args) as resp:
+            if resp.status in REDIRECT_CODES:
+                _follow_same_origin(relay, "POST", url, resp.headers.get("Location") or "")
             if resp.status >= 400:
                 text = _decode(await _read_limited(resp, 1 << 20), resp.charset)
-                raise RelayError(f"POST {url} 返回 HTTP {resp.status}：{describe_body(text, resp.content_type)}")
+                raise RelayError(tr("{method} {url} returned HTTP {status}: {detail}", method="POST", url=url, status=resp.status, detail=describe_body(text, resp.content_type)))
             if resp.content_type != "text/event-stream":
                 # 有的站不管 stream 参数，直接一次性返回
                 text = _decode(await _read_limited(resp, MAX_RESPONSE), resp.charset)
                 try:
                     data = json.loads(text)
                 except json.JSONDecodeError:
-                    raise RelayError(f"POST {url} 返回的不是 JSON：{describe_body(text, resp.content_type)}") from None
-                raise_for_error_payload(data, "对话请求")
+                    raise RelayError(tr("{method} {url} did not return JSON: {detail}", method="POST", url=url, detail=describe_body(text, resp.content_type))) from None
+                raise_for_error_payload(data, tr("Chat request"))
                 message = _first_message(data)
                 return message_text(message), message
             async for event in _iter_sse(resp):
-                raise_for_error_payload(event, "对话请求")
+                raise_for_error_payload(event, tr("Chat request"))
                 for choice in event.get("choices") or []:
                     if not isinstance(choice, dict):
                         continue
@@ -451,9 +618,9 @@ async def _chat_stream(session: aiohttp.ClientSession, relay: Relay, body: dict,
                     if isinstance(delta.get("images"), list):
                         images.extend(delta["images"])
     except TimeoutError:
-        raise RelayError(f"请求超时（{timeout:g} 秒）：POST {url}") from None
+        raise RelayError(tr("Request timed out ({seconds} s): {method} {url}", seconds=f"{timeout:g}", method="POST", url=url)) from None
     except aiohttp.ClientError as e:
-        raise RelayError(f"连不上中转站「{relay.name}」：{e}") from None
+        raise RelayError(tr('Cannot reach relay "{name}": {error}', name=relay.name, error=e)) from None
     message = {"content": "".join(content), "reasoning_content": "".join(reasoning), "images": images}
     return message["content"], message
 
@@ -469,7 +636,7 @@ async def chat_completion(
             request_json(session, relay, "POST", "/v1/chat/completions", json_body=body, timeout=timeout),
             check_interrupt,
         )
-    raise_for_error_payload(data, "对话请求")
+    raise_for_error_payload(data, tr("Chat request"))
     message = _first_message(data)
     return message_text(message), message
 
@@ -479,7 +646,7 @@ async def list_models(relay: Relay, *, timeout: float = 60.0) -> list[str]:
         data = await request_json(session, relay, "GET", "/v1/models", timeout=timeout)
     items = data.get("data") if isinstance(data, dict) else data
     if not isinstance(items, list):
-        raise RelayError(f"看不懂模型列表的格式：{short(data)}")
+        raise RelayError(tr("Cannot understand the model list format: {detail}", detail=short(data)))
     return sorted({str(i["id"]) for i in items if isinstance(i, dict) and i.get("id")})
 
 
@@ -512,7 +679,7 @@ def find_image_refs(message: dict) -> list[str]:
         refs += [m.group(0) for m in DATA_URL_RE.finditer(text) if m.group(1) == "image"]
         refs += [u for u in MD_IMAGE_RE.findall(text) if not u.startswith("data:")]
         refs += [u for u in _urls(text) if urlparse(u).path.lower().endswith(IMAGE_EXTS)]
-    return list(dict.fromkeys(refs))
+    return list(dict.fromkeys(refs))[:MAX_IMAGE_REFS]
 
 
 async def images_api(
@@ -548,7 +715,7 @@ async def images_api(
                              json_body=merge_extra(fields, extra), timeout=timeout),
                 check_interrupt,
             )
-        raise_for_error_payload(data, "生图请求")
+        raise_for_error_payload(data, tr("Image request"))
         items = data.get("data") if isinstance(data, dict) else None
         images, notes = [], []
         for item in items if isinstance(items, list) else []:
@@ -562,7 +729,7 @@ async def images_api(
             if item.get("revised_prompt"):
                 notes.append(item["revised_prompt"])
     if not images:
-        raise RelayError(f"返回里没有图片：{short(data)}")
+        raise RelayError(tr("No image in the response: {detail}", detail=short(data)))
     return images, "\n".join(notes)
 
 
@@ -577,7 +744,7 @@ async def chat_image(
     )
     found = find_image_refs(message)
     if not found:
-        raise RelayError(f"模型没有返回图片，回复内容：{short(text) or '（空）'}")
+        raise RelayError(tr("The model returned no image. Reply: {detail}", detail=short(text) or tr("(empty)")))
     async with new_session() as session:
         images = [await guarded(download(session, relay, ref), check_interrupt) for ref in found]
     return images, strip_data_urls(text)
@@ -599,14 +766,14 @@ async def gemini_image(
     if image_config:
         config["imageConfig"] = image_config
     body = merge_extra({"contents": [{"role": "user", "parts": parts}], "generationConfig": config}, extra)
-    path = f"/v1beta/models/{model.removeprefix('models/')}:generateContent"
+    path = f"/v1beta/models/{quote(model.removeprefix('models/'), safe='')}:generateContent"  # 模型名来自工作流，不能改变路径
     async with new_session() as session:
         data = await guarded(
             request_json(session, relay, "POST", path, json_body=body,
                          headers={"x-goog-api-key": relay.api_key}, timeout=timeout),
             check_interrupt,
         )
-    raise_for_error_payload(data, "Gemini 请求")
+    raise_for_error_payload(data, tr("Gemini request"))
     candidates = data.get("candidates") if isinstance(data, dict) else None
     images, texts = [], []
     for cand in candidates or []:
@@ -623,7 +790,7 @@ async def gemini_image(
         reason = (feedback or {}).get("blockReason") or ", ".join(
             str(c["finishReason"]) for c in candidates or [] if c.get("finishReason")
         )
-        raise RelayError(f"Gemini 没有返回图片（{reason or '原因未知'}），回复内容：{short(''.join(texts)) or '（空）'}")
+        raise RelayError(tr("Gemini returned no image ({reason}). Reply: {detail}", reason=reason or tr("unknown reason"), detail=short(''.join(texts)) or tr("(empty)")))
     return images, "\n".join(texts).strip()
 
 
@@ -739,36 +906,36 @@ async def poll_task(
     deadline = start + timeout
     last_status: Any = object()
     failures = 0
-    tag = f"（任务 ID：{task_id}）" if task_id else ""
+    tag = tr(" (task ID: {task_id})", task_id=task_id) if task_id else ""
     while True:
         try:
             data = await guarded(fetch(), check_interrupt)
         except RelayError as e:
             failures += 1
             if failures >= MAX_POLL_FAILURES or loop.time() >= deadline:
-                raise RelayError(f"{label}查询失败{tag}，任务可能还在运行，可以到站点后台查看：{e}") from None
-            log.warning("[中转站] %s 查询失败（第 %d 次）：%s", label, failures, e)
+                raise RelayError(tr("{label} status check failed{tag}. The task may still be running, check the relay's console: {error}", label=label, tag=tag, error=e)) from None
+            log.warning("[relay] %s status check failed (attempt %d): %s", label, failures, e)
             if on_status:
-                on_status(f"{label}：查询失败，第 {failures} 次，稍后重试…")
+                on_status(tr("{label}: status check failed (attempt {count}), retrying…", label=label, count=failures))
             await sleep_checked(poll_interval, check_interrupt)
             continue
         failures = 0
         status = find_status(data)
         if status != last_status:
-            log.info("[中转站] %s 状态：%s  %s", label, status, short(data, 300))
+            log.info("[relay] %s status: %s  %s", label, status, short(data, 300))
             last_status = status
         progress = find_progress(data)
         if on_progress and progress is not None:
             on_progress(progress)
         if on_status:
             percent = f" {progress:.0f}%" if progress is not None else ""
-            on_status(f"{label}：{status or '处理中'}{percent}，已等待 {loop.time() - start:.0f} 秒")
+            on_status(tr("{label}: {status}{percent}, waited {seconds} s", label=label, status=status or tr("processing"), percent=percent, seconds=f"{loop.time() - start:.0f}"))
         if status in SUCCESS_STATUSES or (status is None and find_video_url(data)):
             return data
         if status in FAILURE_STATUSES:
-            raise RelayError(f"{label}失败{tag}：{find_error_message(data) or short(data)}")
+            raise RelayError(tr("{label} failed{tag}: {detail}", label=label, tag=tag, detail=find_error_message(data) or short(data)))
         if loop.time() >= deadline:
-            raise RelayError(f"{label}等待超时（{timeout:g} 秒）{tag}，最后状态：{status or '未知'}")
+            raise RelayError(tr("{label} timed out ({seconds} s){tag}. Last status: {status}", label=label, seconds=f"{timeout:g}", tag=tag, status=status or tr("unknown")))
         await sleep_checked(poll_interval, check_interrupt)
 
 
@@ -785,20 +952,20 @@ async def _finish_video_task(
     """提交后的通用流程：直接给了地址就下载，否则按任务 ID 轮询。"""
     status = find_status(created)
     if status in FAILURE_STATUSES:
-        raise RelayError(f"视频任务提交失败：{find_error_message(created) or short(created)}")
+        raise RelayError(tr("Video task submission failed: {detail}", detail=find_error_message(created) or short(created)))
     task_id = find_task_id(created)
     url = find_video_url(created) if (status in SUCCESS_STATUSES or not task_id or not query_path) else None
     if not url:
         if not task_id or not query_path:
-            raise RelayError(f"提交后没拿到任务 ID 或视频地址，返回内容：{short(created)}")
-        log.info("[中转站] 视频任务已提交，任务 ID：%s", task_id)
+            raise RelayError(tr("No task ID or video address after submitting. Response: {detail}", detail=short(created)))
+        log.info("[relay] video task submitted, task ID: %s", task_id)
         path = query_path.replace("{task_id}", task_id).replace("{id}", task_id)
         result = await poll_task(
-            lambda: request_json(session, relay, "GET", path, timeout=60), label="视频任务", task_id=task_id, **wait
+            lambda: request_json(session, relay, "GET", path, timeout=60), label=tr("Video task"), task_id=task_id, **wait
         )
         url = find_video_url(result)
         if not url:
-            raise RelayError(f"任务已完成，但返回里找不到视频地址（任务 ID：{task_id}）：{short(result)}")
+            raise RelayError(tr("Task finished, but no video address in the response (task ID: {task_id}): {detail}", task_id=task_id, detail=short(result)))
     return await _download_video(session, relay, url, wait["check_interrupt"])
 
 
@@ -832,10 +999,10 @@ async def video_openai(
             created = await guarded(request_json(session, relay, "POST", "/v1/videos", json_body=body), check_interrupt)
         video_id = find_task_id(created)
         if find_status(created) in FAILURE_STATUSES or not video_id:
-            raise RelayError(f"视频任务提交失败：{find_error_message(created) or short(created)}")
-        log.info("[中转站] 视频任务已提交，ID：%s", video_id)
+            raise RelayError(tr("Video task submission failed: {detail}", detail=find_error_message(created) or short(created)))
+        log.info("[relay] video task submitted, ID: %s", video_id)
         result = await poll_task(
-            lambda: request_json(session, relay, "GET", f"/v1/videos/{video_id}", timeout=60), label="视频任务",
+            lambda: request_json(session, relay, "GET", f"/v1/videos/{video_id}", timeout=60), label=tr("Video task"),
             task_id=video_id, **wait
         )
         url = find_video_url(result) or relay.url(f"/v1/videos/{video_id}/content")
@@ -868,15 +1035,15 @@ async def video_task(relay: Relay, plugin_key: str, body: dict, **wait: Any) -> 
         except RelayError as e:
             if not plugin_key or not any(word in str(e).lower() for word in _NOT_SUBMITTED):
                 raise
-            log.warning("[中转站] 任务插件「%s」用不了，改由站点按模型找插件：%s", plugin_key, e)
+            log.warning("[relay] task plugin %r is not usable, letting the relay pick by model: %s", plugin_key, e)
             created = await submit("/v1/videos")
         task_id = find_task_id(created)
         if find_status(created) in FAILURE_STATUSES or not task_id:
-            raise RelayError(f"视频任务提交失败：{find_error_message(created) or short(created)}")
-        log.info("[中转站] 视频任务已提交，任务 ID：%s", task_id)
+            raise RelayError(tr("Video task submission failed: {detail}", detail=find_error_message(created) or short(created)))
+        log.info("[relay] video task submitted, task ID: %s", task_id)
         path = f"/v1/tasks/{quote(task_id, safe='')}"
         result = await poll_task(
-            lambda: request_json(session, relay, "GET", path, timeout=60), label="视频任务", task_id=task_id, **wait
+            lambda: request_json(session, relay, "GET", path, timeout=60), label=tr("Video task"), task_id=task_id, **wait
         )
         try:
             listing = await guarded(
@@ -889,10 +1056,10 @@ async def video_task(relay: Relay, plugin_key: str, body: dict, **wait: Any) -> 
             else:
                 url = find_video_url(result)  # 插件没有实现产物接口
             if not url:
-                raise RelayError("站点没有列出成片")
+                raise RelayError(tr("The relay listed no finished video"))
             return await _download_video(session, relay, url, check_interrupt)
         except RelayError as e:
-            raise RelayError(f"任务已完成，但下载成片失败（任务 ID：{task_id}）：{e}") from None
+            raise RelayError(tr("Task finished, but downloading the video failed (task ID: {task_id}): {error}", task_id=task_id, error=e)) from None
 
 
 async def video_chat(
@@ -902,7 +1069,7 @@ async def video_chat(
     text, message = await chat_completion(relay, body, timeout=timeout, check_interrupt=check_interrupt, stream=stream)
     url = find_video_url_in_text(text) or find_video_url_in_text(message.get("reasoning_content") or "")
     if not url:
-        raise RelayError(f"回复里没有找到视频链接：{short(text) or '（空）'}")
+        raise RelayError(tr("No video link found in the reply: {detail}", detail=short(text) or tr("(empty)")))
     async with new_session() as session:
         return await _download_video(session, relay, url, check_interrupt)
 

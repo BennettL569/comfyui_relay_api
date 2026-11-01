@@ -1,0 +1,75 @@
+{
+  "RelayAPI_Chat": {
+    "display_name": "中转站 · 文本对话",
+    "description": "调用中转站的 /v1/chat/completions（OpenAI 兼容格式）。接上图片就能识图、反推提示词。",
+    "inputs": {
+      "relay": { "name": "中转站", "tooltip": "在「中转站管理器」窗口（插件目录里的 tools/start_manager）里添加。手动改了 relays.json 的话按 R 刷新节点即可。" },
+      "model": { "name": "模型", "tooltip": "中转站里的模型名，可以用「中转站 · 模型列表」节点查询" },
+      "prompt": { "name": "提示词" },
+      "system": { "name": "系统提示词" },
+      "images": { "name": "图片", "tooltip": "可选，接上后图片会一起发给模型（模型需支持识图）" },
+      "temperature": { "name": "温度", "tooltip": "-1 表示不发送，用模型默认值（部分推理模型只接受默认值）" },
+      "max_tokens": { "name": "最大输出", "tooltip": "0 表示不发送" },
+      "seed": { "tooltip": "不会发给接口，只决定要不要重新请求：值变了才重新调用（会扣费），固定不变就复用上次结果" },
+      "extra_json": { "name": "额外参数", "tooltip": "JSON 对象，会合并进请求体，如 {\"quality\": \"high\"}；值写 null 表示删掉该字段" },
+      "timeout": { "name": "超时(秒)" }
+    },
+    "outputs": { "0": { "name": "文本" } }
+  },
+  "RelayAPI_Image": {
+    "display_name": "中转站 · 生图",
+    "description": "通过中转站生图或改图，支持 OpenAI 图像接口、Seedream 类接口、对话接口出图和 Gemini 原生接口。",
+    "inputs": {
+      "relay": { "name": "中转站", "tooltip": "在「中转站管理器」窗口（插件目录里的 tools/start_manager）里添加。手动改了 relays.json 的话按 R 刷新节点即可。" },
+      "model": { "name": "模型", "tooltip": "中转站里的模型名，可以用「中转站 · 模型列表」节点查询" },
+      "prompt": { "name": "提示词" },
+      "images": { "name": "参考图", "tooltip": "可选，一个批次里的多张图会作为多张参考图一起发送" },
+      "api_format": { "name": "接口格式", "tooltip": "images：OpenAI 图像接口（gpt-image、dall-e、flux 等），有参考图时走 /v1/images/edits\nimages-json：参考图放进 image 字段发到 /v1/images/generations（Seedream / 即梦等）\nchat：走对话接口出图（多数站的 nano-banana 用这个）\ngemini：Gemini 原生 /v1beta 接口（nano-banana，可设宽高比和 4K）" },
+      "api_format_size": { "name": "尺寸" },
+      "api_format_n": { "name": "张数" },
+      "api_format_quality": { "name": "质量" },
+      "api_format_aspect_ratio": { "name": "宽高比" },
+      "api_format_image_size": { "name": "分辨率" },
+      "seed": { "tooltip": "不会发给接口，只决定要不要重新请求：值变了才重新调用（会扣费），固定不变就复用上次结果" },
+      "extra_json": { "name": "额外参数", "tooltip": "JSON 对象，会合并进请求体，如 {\"quality\": \"high\"}；值写 null 表示删掉该字段" },
+      "timeout": { "name": "超时(秒)" }
+    },
+    "outputs": { "0": { "name": "图片" }, "1": { "name": "文本" } }
+  },
+  "RelayAPI_Video": {
+    "display_name": "中转站 · 生视频",
+    "description": "通过中转站生成视频：提交任务、轮询进度、下载成片。接上图片就是图生视频。",
+    "inputs": {
+      "relay": { "name": "中转站", "tooltip": "在「中转站管理器」窗口（插件目录里的 tools/start_manager）里添加。手动改了 relays.json 的话按 R 刷新节点即可。" },
+      "model": { "name": "模型", "tooltip": "中转站里的模型名，可以用「中转站 · 模型列表」节点查询" },
+      "prompt": { "name": "提示词" },
+      "image": { "name": "首帧图", "tooltip": "可选，接上后为图生视频（只用第一张）" },
+      "api_format": { "name": "接口格式", "tooltip": "unified：new-api 统一视频接口 /v1/video/generations（可灵、海螺、Vidu、Seedance 等多数站都支持）\nopenai：OpenAI / Sora 格式 /v1/videos\nchat：走对话接口出视频，回复里带视频链接（部分站的 veo、sora）\ncustom：自己填提交和查询路径，适配厂商原生格式\ntask：new-api 任务插件模型（模型列表里标着 task plugin，如 MiniMax-H3），站点按模型自动找插件" },
+      "api_format_duration": { "name": "时长(秒)", "tooltip": "0 表示不发送。MiniMax-H3 支持 4 到 15" },
+      "api_format_seconds": { "name": "时长(秒)", "tooltip": "0 表示不发送。Sora 2 支持 4 / 8 / 12" },
+      "api_format_size": { "name": "分辨率" },
+      "api_format_image_encoding": { "name": "图片编码", "tooltip": "图生视频时 image 字段的写法，报错时换另一个试试" },
+      "api_format_body_format": { "name": "请求格式" },
+      "api_format_stream": { "name": "流式", "tooltip": "视频生成耗时长，多数站要求流式" },
+      "api_format_submit_path": { "name": "提交路径" },
+      "api_format_query_path": { "name": "查询路径" },
+      "api_format_image_field": { "name": "图片字段", "tooltip": "首帧图放进请求体的哪个字段，留空则不发送" },
+      "api_format_plugin_key": { "name": "任务插件", "tooltip": "留空时提交到 /v1/videos，站点按模型找插件。站长让你指定时才填，会提交到 /v1/tasks/{插件}" },
+      "api_format_ratio": { "name": "宽高比", "tooltip": "auto 表示不发送。adaptive 是跟随首帧图，只有接了图才能用" },
+      "seed": { "tooltip": "不会发给接口，只决定要不要重新请求：值变了才重新调用（会扣费），固定不变就复用上次结果" },
+      "poll_interval": { "name": "轮询间隔(秒)" },
+      "timeout": { "name": "超时(秒)" },
+      "extra_json": { "name": "额外参数", "tooltip": "JSON 对象，会合并进请求体，如 {\"quality\": \"high\"}；值写 null 表示删掉该字段" }
+    },
+    "outputs": { "0": { "name": "视频" }, "1": { "name": "视频地址" } }
+  },
+  "RelayAPI_Models": {
+    "display_name": "中转站 · 模型列表",
+    "description": "列出中转站 /v1/models 里的模型名，方便填进其他节点。",
+    "inputs": {
+      "relay": { "name": "中转站", "tooltip": "在「中转站管理器」窗口（插件目录里的 tools/start_manager）里添加。手动改了 relays.json 的话按 R 刷新节点即可。" },
+      "keyword": { "name": "关键字" }
+    },
+    "outputs": { "0": { "name": "模型列表" } }
+  }
+}

@@ -51,6 +51,7 @@ class MockRelay:
         self.cdn = f"http://127.0.0.1:{cdn_port}"
         self.requests: list[tuple[str, object]] = []
         self.cdn_auth: list[str | None] = []  # 每次 CDN 请求带的 Authorization
+        self.cdn_goog: list[str | None] = []  # 每次 CDN 请求带的 x-goog-api-key
         self.api_auth: list[str | None] = []  # 请求 /api/status、/api/pricing 时带的 Authorization（应该不带）
         self.polls: dict[str, int] = {}
         self._runners: list[web.AppRunner] = []
@@ -302,15 +303,23 @@ class MockRelay:
         self.log("task_content", {"key": request.match_info["key"], "auth": request.headers.get("Authorization")})
         return web.Response(body=MP4, content_type="video/mp4")
 
+    # ---- 中转站自己的文件和重定向 ----
+    async def owned_file(self, request: web.Request):
+        return web.Response(body=PNG, content_type="image/png")
+
+    async def redirect_to(self, request: web.Request):
+        return web.Response(status=302, headers={"Location": request.query["to"]})
+
     # ---- 第三方存储 ----
     async def cdn_file(self, request: web.Request):
         self.cdn_auth.append(request.headers.get("Authorization"))
+        self.cdn_goog.append(request.headers.get("x-goog-api-key"))
         name = request.match_info["name"]
         if name == "test.png":
             return web.Response(body=PNG, content_type="image/png")
         if name == "test.mp4":
             return web.Response(body=MP4, content_type="video/mp4")
-        return web.Response(status=404, text="not found")
+        return web.json_response({"error": {"message": "internal-secret"}}, status=404)
 
     async def start(self) -> None:
         relay = web.Application(middlewares=[self.auth], client_max_size=64 * 1024 * 1024)
@@ -318,6 +327,9 @@ class MockRelay:
             web.get("/api/status", self.api_status),
             web.get("/api/pricing", self.api_pricing),
             web.get("/v1/models", self.models),
+            web.get("/owned/{name}", self.owned_file),
+            web.get("/redirect", self.redirect_to),
+            web.post("/redirect", self.redirect_to),
             web.post("/v1/chat/completions", self.chat),
             web.post("/v1/images/generations", self.images_generations),
             web.post("/v1/images/edits", self.images_edits),

@@ -4,9 +4,11 @@
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -19,10 +21,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, PLUGIN)
+os.environ["COMFY_RELAY_LANG"] = "zh"  # 断言用的是中文原话，顺带核对翻译。英文默认值在 t_language 里单独测
 
 import manager_api  # noqa: E402
 import manager_app  # noqa: E402
 import relay_client as rc  # noqa: E402
+import relay_i18n as i18n  # noqa: E402
 import relay_probe as rp  # noqa: E402
 import relay_store as rs  # noqa: E402
 from mock_relay import KEY, KEY_LIMITED, MockRelay  # noqa: E402
@@ -148,7 +152,7 @@ async def t_store_edge(mock):
     # 代理密码在界面上遮挡；原样提交回来表示没改
     rs.update_relay("主站", "主站", "https://api.a.com/v1", "sk-aaaaaaaaaaaaaaaaaaaa", "http://alice:S3cret@10.0.0.5:3128")
     view = rs.list_relays()[0]
-    assert view["proxy"] == "http://alice:•••@10.0.0.5:3128" and "S3cret" not in json.dumps(view)
+    assert view["proxy"] == "http://•••@10.0.0.5:3128" and "S3cret" not in json.dumps(view) and "alice" not in json.dumps(view)
     rs.update_relay("主站", "主站", "https://api.a.com/v1", "", view["proxy"])
     assert read_config()["主站"]["proxy"] == "http://alice:S3cret@10.0.0.5:3128"
     # 同一个站点去掉 /v1、去掉代理：可以沿用令牌；换协议、换代理：要重填
@@ -263,9 +267,11 @@ async def t_classify(mock):
 # ---------- HTTP 接口 ----------
 
 async def t_api_comfy_mode(mock):
-    """ComfyUI 模式：只挂路由，不要求令牌。"""
+    """接口本身的行为。这里按独立管理器的权限跑，令牌和 Host 校验在 t_api_standalone_security 里测，
+    ComfyUI 模式下的限制在 t_edit_is_local_only 里测。"""
     write_config({})
     app = aiohttp.web.Application()
+    app[manager_api.STANDALONE] = True
     routes = aiohttp.web.RouteTableDef()
     manager_api.add_routes(routes)
     app.add_routes(routes)
@@ -331,7 +337,7 @@ async def t_api_comfy_mode(mock):
                        {"name": "模拟站", "base_url": "https://evil.example.com/v1", "api_key": ""}, status=400)
 
             reply = await call("POST", "chat_test", {"name": "模拟站", "model": "mock-chat"})
-            assert reply["reply"].startswith("echo:这是连通性测试"), reply
+            assert reply["reply"].startswith("echo:This is a connectivity test"), reply
 
             renamed = await call("PUT", f"relays/{aiohttp.helpers.quote('模拟站', safe='')}",
                                  {"name": "模拟站2", "base_url": MOCK_URL, "api_key": "", "proxy": ""})
@@ -341,7 +347,7 @@ async def t_api_comfy_mode(mock):
 
             # 页面和静态文件：只放行页面自己的几个文件
             async with s.get(f"{base}/manager") as r:
-                assert r.status == 200 and "中转站管理器" in await r.text()  # 自动跳转到 /manager/
+                assert r.status == 200 and "Relay Manager" in await r.text()  # 自动跳转到 /manager/
             for name in ("app.js", "style.css", "icon.svg", "icon.ico"):
                 async with s.get(f"{base}/manager/{name}") as r:
                     assert r.status == 200, name
@@ -371,7 +377,7 @@ async def t_api_standalone_security(mock):
             async with s.get(f"{base}/state?token=%E4%B8%AD%C3%A9") as r:
                 assert r.status == 403, "非 ASCII 令牌应该是 403 而不是 500"
             async with s.get(f"{base}/manager/?token={server.token}") as r:
-                assert r.status == 200 and "中转站管理器" in await r.text()
+                assert r.status == 200 and "Relay Manager" in await r.text()
             # 再次双击快捷方式：hello 确认身份，代码没变就约好会有新窗口，期间不退出
             server.ever_connected, server.last_disconnect = True, 0.0
             async with s.get(f"{base}/hello", params={"code": "other"}, headers={"X-Relay-Token": server.token}) as r:
@@ -454,6 +460,204 @@ async def t_reopen_after_update(mock):
         shutil.rmtree(folder, ignore_errors=True)
 
 
+async def t_edit_is_local_only(mock):
+    """能改配置、能访问请求里给的地址、会花钱的接口：ComfyUI 里默认关闭，打开后也只给运行服务的这台电脑用。"""
+    for address in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+        assert manager_api.is_loopback(address), address
+    for address in ("192.168.1.5", "8.8.8.8", "", None, "not-an-ip"):
+        assert not manager_api.is_loopback(address), address
+
+    class Fake:  # 测试环境连不出真正的远程地址，直接构造
+        def __init__(self, remote, headers=None, host="192.168.1.2:8188"):
+            self.remote, self.headers, self.host, self.app = remote, headers or {}, host, {}
+
+    assert not manager_api.is_local(Fake("192.168.1.5")), "局域网里的其他电脑不算本机"
+    assert manager_api.is_local(Fake("127.0.0.1"))
+
+    relay_entry = {"base_url": MOCK_URL, "api_key": KEY, "proxy": ""}
+    write_config({"站": relay_entry})
+    app = aiohttp.web.Application()
+    routes = aiohttp.web.RouteTableDef()
+    manager_api.add_routes(routes)
+    manager_api.add_comfy_routes(routes, lambda event: 1)
+    app.add_routes(routes)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    await aiohttp.web.TCPSite(runner, "127.0.0.1", 18947).start()
+    host = "127.0.0.1:18947"
+    base = f"http://{host}/relay_api"
+    editing = [("POST", "parse", {"text": "x"}), ("POST", "relays", {"name": "新站", "base_url": MOCK_URL, "api_key": KEY}),
+               ("PUT", "relays/站", {"name": "站", "base_url": MOCK_URL, "api_key": KEY}), ("DELETE", "relays/站", None),
+               ("POST", "placeholders/remove", {}), ("POST", "test", {"base_url": MOCK_URL, "api_key": KEY}),
+               ("POST", "chat_test", {"name": "站", "model": "m"})]
+    local_only = [("POST", "language", {"lang": "en"}), ("POST", "notify", {"type": "relays-changed"})]
+    try:
+        async with aiohttp.ClientSession() as s:
+            # 默认关闭：连本机来的请求也不行（内网穿透过来的请求看起来就像本机）
+            for method, path, body in editing:
+                async with s.request(method, f"{base}/{path}", json=body) as r:
+                    assert r.status == 403 and "中转站管理器" in (await r.json())["error"], (path, r.status)
+            assert list(read_config()) == ["站"], "被拒绝的请求不能改到配置"
+            async with s.get(f"{base}/state") as r:
+                state = await r.json()
+            assert state["can_edit"] is False and state["panel_edit"] is False and state["standalone"] is False, state
+            assert state["config_path"] == rc.config_path() and state["start_script"].endswith(("start_manager.bat", "start_manager.sh")), state
+            async with s.post(f"{base}/panel_edit", json={"enabled": True}) as r:
+                assert r.status in (404, 405), "ComfyUI 里不能有打开开关的接口"
+            # 显示语言这类小操作，本机可以
+            async with s.post(f"{base}/language", json={"lang": "zh"}) as r:
+                assert r.status == 200
+
+            # 用户手动打开后（开关在磁盘上）：本机的同源请求可以改，其他的还是不行
+            write_config({"_panel_edit": True, "站": relay_entry})
+            for headers in ({"Origin": "https://evil.example.com"}, {"Origin": "null"}, {"X-Forwarded-For": "8.8.8.8"},
+                            {"CF-Connecting-IP": "8.8.8.8"}, {"True-Client-IP": "8.8.8.8"}):
+                for method, path, body in editing + local_only:
+                    async with s.request(method, f"{base}/{path}", json=body, headers=headers) as r:
+                        assert r.status == 403, (headers, path, r.status)
+            assert list(read_config()) == ["_panel_edit", "站"], "被拒绝的请求不能改到配置"
+            # 添加中转站改不了这个开关
+            async with s.post(f"{base}/relays", json={"name": "_panel_edit", "base_url": MOCK_URL, "api_key": KEY}) as r:
+                assert r.status == 400
+            assert read_config()["_panel_edit"] is True
+            # 开关打开后本机能改，但访问没保存的地址并读回结果，ComfyUI 的接口还是不做
+            async with s.post(f"{base}/parse", json={"text": "x"}) as r:
+                assert r.status == 200
+            async with s.post(f"{base}/test", json={"base_url": MOCK_URL, "api_key": KEY}) as r:
+                assert r.status == 403
+
+            # 只读的接口照常能用，但不告诉对方配置文件在哪（路径里常有用户名），也不给完整令牌
+            async with s.get(f"{base}/state", headers={"X-Forwarded-For": "8.8.8.8"}) as r:
+                state = await r.json()
+            assert state["can_edit"] is False and state["config_path"] == "" and KEY not in json.dumps(state), state
+            async with s.get(f"{base}/models/站", headers={"X-Forwarded-For": "8.8.8.8"}) as r:
+                assert r.status == 200 and (await r.json())["ok"]
+
+            # 本机的同源请求不受影响
+            async with s.get(f"{base}/state") as r:
+                state = await r.json()
+            assert state["can_edit"] is True and state["config_path"] == rc.config_path(), state
+            async with s.post(f"{base}/parse", json={"text": "x"}, headers={"Origin": f"http://{host}"}) as r:
+                assert r.status == 200
+
+    finally:
+        await runner.cleanup()
+
+    # 独立管理器有一次性令牌：不用打开开关就能改，开关也只有这里能改
+    write_config({"站": relay_entry})
+    server = manager_app.ManagerServer(port=0)
+    await server.start()
+    try:
+        headers = {"X-Relay-Token": server.token}
+        async with aiohttp.ClientSession() as s:
+            standalone = f"http://127.0.0.1:{server.port}/relay_api"
+            async with s.get(f"{standalone}/state", headers=headers) as r:
+                state = await r.json()
+            assert state["can_edit"] is True and state["standalone"] is True and state["panel_edit"] is False, state
+            async with s.post(f"{standalone}/panel_edit", json={"enabled": True}) as r:
+                assert r.status == 403, "没带令牌不能改开关"
+            for enabled in (True, False):
+                async with s.post(f"{standalone}/panel_edit", json={"enabled": enabled}, headers=headers) as r:
+                    assert r.status == 200
+                assert read_config().get("_panel_edit", False) is enabled and "站" in read_config()
+    finally:
+        await server.stop()
+
+
+UI_MODULES = ("relay_client.py", "relay_probe.py", "relay_store.py", "manager_api.py", "manager_app.py", "nodes.py")
+UI_PAGES = ("manager/app.js", "manager/index.html", "web/relay_manager.js", "web/relay_text.js")
+VARIABLE = re.compile(r"\{(\w+)\}")
+CJK = re.compile(r"[一-鿿]")
+# 这些中文不显示给用户：站点报错的匹配词、粘贴识别的关键词、旧示例的占位文字、节点库的搜索别名
+NOT_UI_NAMES = {"PLACEHOLDER_WORDS", "_NOT_SUBMITTED", "QUERY_BLOCKED_WORDS", "LABELED_KEY_RE", "BARE_PROXY_RE",
+                "URL_LABEL_RE", "PROXY_LABEL_RE"}
+
+
+def _plugin_text(name: str) -> str:
+    with open(os.path.join(PLUGIN, name), encoding="utf-8") as f:
+        return f.read()
+
+
+def _ui_strings(tree: ast.AST):
+    """代码里所有可能显示给用户的字符串：跳过文档字符串和上面列出的常量。"""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                first.value.value = ""
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in NOT_UI_NAMES for t in node.targets):
+            node.value = ast.Constant("")
+        if isinstance(node, ast.keyword) and node.arg == "search_aliases":
+            node.value = ast.Constant("")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            yield node.value
+
+
+def _page_code(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"(?<![:\"'`])//.*$", "", text, flags=re.M)
+
+
+async def t_language(mock):
+    """界面的源文字是英文，默认显示英文；中文翻译完整，变量对得上。"""
+    catalog = i18n.catalog()
+    used = {rs.KEY_REQUIRED_MSG, rp.QUERY_BLOCKED_MSG}
+    for name in UI_MODULES:
+        tree = ast.parse(_plugin_text(name))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "tr":
+                first = node.args[0]
+                if isinstance(first, (ast.Name, ast.Attribute)):
+                    continue  # 上面列出的两个常量
+                assert isinstance(first, ast.Constant), f"{name}:{node.lineno} tr() 的文字要写成字面量才能翻译"
+                used.add(first.value)
+                names = {k.arg for k in node.keywords}
+                assert names == set(VARIABLE.findall(first.value)), f"{name}:{node.lineno} 变量对不上：{first.value}"
+        leftover = [s for s in _ui_strings(tree) if CJK.search(s)]
+        assert not leftover, f"{name} 里还有显示给用户的中文：{leftover[:5]}"
+    for name in UI_PAGES:
+        code = _page_code(_plugin_text(name))
+        leftover = [line for line in code.splitlines() if CJK.search(line) and '"中文"' not in line]  # 语言开关上写的就是中文
+        assert not leftover, f"{name} 里还有显示给用户的中文：{leftover[:5]}"
+        for literal in re.findall(r"\bt\(\s*\"((?:[^\"\\]|\\.)*)\"", code):
+            used.add(literal.replace('\\"', '"'))
+    missing = sorted(used - set(catalog))
+    assert not missing, f"这些文字没有中文翻译：{missing[:10]}"
+    unused = sorted(set(catalog) - used)
+    assert not unused, f"翻译里有用不到的文字：{unused[:10]}"
+    for english, chinese in catalog.items():
+        assert set(VARIABLE.findall(english)) == set(VARIABLE.findall(chinese)), f"变量对不上：{english} → {chinese}"
+        assert CJK.search(chinese) or not CJK.search(english), english
+        assert not CJK.search(english), f"原文应该是英文：{english}"
+
+    with open(os.path.join(PLUGIN, "locales", "zh", "nodeDefs.json"), encoding="utf-8") as f:
+        node_defs = json.load(f)
+    assert set(node_defs) == {"RelayAPI_Chat", "RelayAPI_Image", "RelayAPI_Video", "RelayAPI_Models"}, set(node_defs)
+    for name in ("LICENSE", "pyproject.toml", "relays.example.json", "tools/create_shortcut.ps1", "tools/create_shortcut.bat",
+                 "tools/start_manager.bat", "tools/start_manager.sh"):
+        assert not CJK.search(_plugin_text(name)), f"{name} 里还有中文"
+
+    # 没设置过语言就是英文；切换后后端的报错也跟着变
+    code = ("import os, sys; sys.path.insert(0, sys.argv[1]); os.environ.pop('COMFY_RELAY_LANG', None); "
+            "import relay_i18n; print(relay_i18n.language())")
+    done = await asyncio.create_subprocess_exec(sys.executable, "-c", code, PLUGIN, stdout=asyncio.subprocess.PIPE)
+    assert (await done.communicate())[0].decode().strip() == "en", "默认语言应该是英文"
+    i18n.set_language("en")
+    try:
+        expect_error(lambda: rs.check_base_url(""), "Please enter the API address")
+        assert "task-plugin" in rp.classify("MiniMax-H3", ["openai"], "task plugin")["reason"]
+    finally:
+        i18n.set_language("zh")
+    expect_error(lambda: rs.check_base_url(""), "请填写接口地址")
+    try:
+        i18n.set_language("fr")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("不支持的语言应该报错")
+
+
 async def t_bridge(mock):
     """独立管理器 → 正在运行的 ComfyUI：找到端口、转发「刷新下拉框」「添加节点」通知。"""
     write_config({})
@@ -508,7 +712,7 @@ async def t_bridge(mock):
 
 
 TESTS = [t_store_crud, t_parse, t_store_edge, t_classify, t_api_comfy_mode, t_api_standalone_security,
-         t_reopen_after_update, t_bridge]
+         t_reopen_after_update, t_edit_is_local_only, t_language, t_bridge]
 
 
 async def main() -> int:
